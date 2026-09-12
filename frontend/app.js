@@ -5,8 +5,9 @@ const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const fmt = (x, d = 2) => (x === null || x === undefined || Number.isNaN(x)) ? "—" : Number(x).toFixed(d);
 const pct = (x) => (x === null || x === undefined) ? "—" : Math.round(x * 100) + "%";
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-// ------------------------------------------------------------------ tabs + health
+// ------------------------------------------------------------------ tabs + health + share
 $$(".tab").forEach(b => b.addEventListener("click", () => {
   $$(".tab").forEach(t => t.classList.toggle("active", t === b));
   $$(".tabpane").forEach(p => p.classList.toggle("active", p.id === "tab-" + b.dataset.tab));
@@ -19,7 +20,7 @@ async function loadHealth() {
     HEALTH = await r.json();
     const el = $("#health");
     el.textContent = `${HEALTH.status} · ${HEALTH.mode}` + (HEALTH.model_meta && HEALTH.model_meta.val_auc ? ` · val AUC ${fmt(HEALTH.model_meta.val_auc, 3)}` : "") +
-      ` · semantic: ${HEALTH.semantic_mode}` + (HEALTH.whisper_available ? "" : " (no whisper)");
+      ` · agent: ${HEALTH.gemini_available ? "gemini" : "scripted"} + ${HEALTH.elevenlabs_available ? "elevenlabs" : "browser voice"}`;
     el.className = "pill " + (HEALTH.status === "ok" ? "ok" : "bad");
     $("#health-json").textContent = JSON.stringify(HEALTH, null, 2);
     if (!HEALTH.whisper_available) { $("#opt-semantic").disabled = true; $("#opt-semantic").parentElement.title = "faster-whisper not installed on the server"; }
@@ -29,6 +30,27 @@ async function loadHealth() {
 }
 loadHealth();
 setInterval(loadHealth, 15000);
+
+async function loadShare() {
+  try {
+    const j = await (await fetch("/share")).json();
+    const btn = $("#share-btn");
+    const url = j.public_url || (j.lan_urls && j.lan_urls[0]) || "";
+    if (!url) return;
+    btn.classList.remove("hidden");
+    btn.title = j.public_url ? "public HTTPS link (works for anyone, including the live call)" : "LAN link (same network; the live call needs HTTPS or localhost for the microphone)";
+    btn.onclick = async () => {
+      const lines = [];
+      if (j.public_url) lines.push("Public: " + j.public_url);
+      (j.lan_urls || []).forEach(u => lines.push("LAN: " + u));
+      try { await navigator.clipboard.writeText(url); btn.textContent = "Copied!"; setTimeout(() => btn.textContent = "Share link", 1500); } catch (e) { /* clipboard blocked */ }
+      $("#share-box").classList.remove("hidden");
+      $("#share-box").innerHTML = lines.map(l => `<div>${esc(l)}</div>`).join("") + (j.public_url ? "" : `<div class="muted small">Run <code>share.ps1</code> (or <code>share.sh</code>) on the host to get a public HTTPS link.</div>`);
+    };
+  } catch (e) { /* no share info */ }
+}
+loadShare();
+setInterval(loadShare, 20000);
 
 // ------------------------------------------------------------------ analyze tab
 const drop = $("#drop"), fileInput = $("#file");
@@ -69,9 +91,9 @@ async function runBatch(files) {
     try {
       const r = await fetch("/detect", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ audio: b64 }) });
       const j = await r.json();
-      row = `<td>${f.name}</td><td class="${j.is_synthetic ? "pos" : "neg"}">${j.is_synthetic}</td><td>${fmt(j.confidence, 3)}</td><td>${((performance.now() - t0) / 1000).toFixed(2)} s</td>`;
+      row = `<td>${esc(f.name)}</td><td class="${j.is_synthetic ? "pos" : "neg"}">${j.is_synthetic}</td><td>${fmt(j.confidence, 3)}</td><td>${((performance.now() - t0) / 1000).toFixed(2)} s</td>`;
       n++; if (j.is_synthetic) syn++;
-    } catch (e) { row = `<td>${f.name}</td><td colspan="3">error: ${e.message}</td>`; }
+    } catch (e) { row = `<td>${esc(f.name)}</td><td colspan="3">error: ${esc(e.message)}</td>`; }
     const tr = document.createElement("tr"); tr.innerHTML = row; tb.appendChild(tr);
   }
   $("#progress").textContent = `${n} files: ${syn} synthetic, ${n - syn} human.`;
@@ -83,7 +105,7 @@ async function loadSamples() {
     const j = await (await fetch("/samples")).json();
     if (!j.enabled || !j.samples.length) return;
     const sel = $("#sample");
-    sel.innerHTML = j.samples.map(s => `<option value="${s.name}">${s.name}${s.label ? " · " + s.label : ""}${s.split ? " (" + s.split + ")" : ""}</option>`).join("");
+    sel.innerHTML = j.samples.map(s => `<option value="${esc(s.name)}">${esc(s.name)}${s.label ? " · " + s.label : ""}${s.split ? " (" + s.split + ")" : ""}</option>`).join("");
     $("#samples-box").classList.remove("hidden");
   } catch (e) { /* samples disabled */ }
 }
@@ -108,6 +130,10 @@ function fileToBase64(file) {
 }
 
 // ------------------------------------------------------------------ result renderer
+function scoreColor(s) {
+  return s === null || s === undefined ? "#3b3630" : (s < 0.4 ? "var(--human)" : (s > 0.6 ? "var(--synthetic)" : "var(--warn)"));
+}
+
 function renderResult(res, root, title) {
   const tpl = $("#tpl-result").content.cloneNode(true);
   const f = (k) => tpl.querySelector(`[data-f="${k}"]`);
@@ -120,6 +146,10 @@ function renderResult(res, root, title) {
   f("p").textContent = fmt(p, 3);
   f("meta").textContent = `${title ? title + " · " : ""}${fmt(res.duration_seconds, 1)} s of audio, ${fmt(res.speech_seconds, 1)} s of caller speech · evidence ${pct(res.evidence_level)} · ${res.mode} · ${fmt(res.timing.total_s)} s` +
     (res.input && !res.input.has_agent_channel ? " · no agent channel (turn-taking signals unavailable)" : "");
+  // flat rectangular probability bar: fill = p(synthetic), colour by verdict
+  const fill = f("pfill");
+  fill.style.width = (p * 100) + "%";
+  fill.style.background = unsure ? "var(--warn)" : (res.is_synthetic ? "var(--synthetic)" : "var(--human)");
   tpl.querySelector(".pmark").style.left = (p * 100) + "%";
 
   // aspects
@@ -127,11 +157,10 @@ function renderResult(res, root, title) {
   for (const [k, a] of Object.entries(res.aspects)) {
     const d = document.createElement("div");
     const s = a.score;
-    const col = s === null ? "#3b4252" : (s < 0.4 ? "var(--human)" : (s > 0.6 ? "var(--synthetic)" : "var(--warn)"));
     d.className = "aspect";
-    d.innerHTML = `<div class="aspect-head"><span class="aspect-name">${a.label}</span><span class="muted small">${a.n_terms} cues</span><span class="aspect-score">${s === null ? "n/a" : Math.round(s * 100)}</span></div>
-      <div class="bar"><i style="width:${s === null ? 0 : s * 100}%;background:${col}"></i></div>
-      <div class="aspect-ev">${(a.evidence || []).map(e => `<div><span>${e.desc} <code>${e.feature}</code></span><span>${fmt(e.value, 3)} <b class="read-${e.read}">${e.read}</b></span></div>`).join("") || "<div>no cues available for this clip</div>"}</div>`;
+    d.innerHTML = `<div class="aspect-head"><span class="aspect-name">${esc(a.label)}</span><span class="muted small">${a.n_terms} cues</span><span class="aspect-score">${s === null ? "n/a" : Math.round(s * 100)}</span></div>
+      <div class="bar"><i style="width:${s === null ? 0 : s * 100}%;background:${scoreColor(s)}"></i></div>
+      <div class="aspect-ev">${(a.evidence || []).map(e => `<div><span>${esc(e.desc)} <code>${esc(e.feature)}</code></span><span>${fmt(e.value, 3)} <b class="read-${e.read}">${e.read}</b></span></div>`).join("") || "<div>no cues available for this clip</div>"}</div>`;
     d.addEventListener("click", () => d.classList.toggle("open"));
     asp.appendChild(d);
   }
@@ -140,7 +169,7 @@ function renderResult(res, root, title) {
   const attacks = Object.entries(res.attack_profile).sort((a, b) => b[1].p - a[1].p);
   for (const [k, a] of attacks) {
     const d = document.createElement("div"); d.className = "attack";
-    d.innerHTML = `<div class="row2"><span>${a.label}</span><span><b>${pct(a.p)}</b> <span class="muted small">(cue strength ${Math.round(a.raw * 100)})</span></span></div><div class="bar"><i style="width:${a.p * 100}%;background:var(--synthetic)"></i></div>`;
+    d.innerHTML = `<div class="row2"><span>${esc(a.label)}</span><span><b>${pct(a.p)}</b> <span class="muted small">(cue strength ${Math.round(a.raw * 100)})</span></span></div><div class="bar"><i style="width:${a.p * 100}%;background:var(--synthetic)"></i></div>`;
     at.appendChild(d);
   }
   // signals
@@ -158,32 +187,34 @@ function renderResult(res, root, title) {
   const c = res.contributions;
   if (c && c.groups) {
     const g = Object.entries(c.groups).sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
-    f("contrib").innerHTML = `<div class="groups">${g.map(([k, v]) => `<span class="${v > 0 ? "pos" : "neg"}">${k} ${v > 0 ? "+" : ""}${fmt(v, 2)}</span>`).join("")}</div>
+    f("contrib").innerHTML = `<div class="groups">${g.map(([k, v]) => `<span class="${v > 0 ? "pos" : "neg"}">${esc(k)} ${v > 0 ? "+" : ""}${fmt(v, 2)}</span>`).join("")}</div>
       <table class="contrib"><thead><tr><th>feature</th><th class="num">value</th><th class="num">contribution</th></tr></thead><tbody>
-      ${c.top_features.map(t => `<tr><td><code>${t.feature}</code></td><td class="num">${fmt(t.value, 3)}</td><td class="num ${t.contribution > 0 ? "pos" : "neg"}">${t.contribution > 0 ? "+" : ""}${fmt(t.contribution, 2)}</td></tr>`).join("")}
+      ${c.top_features.map(t => `<tr><td><code>${esc(t.feature)}</code></td><td class="num">${fmt(t.value, 3)}</td><td class="num ${t.contribution > 0 ? "pos" : "neg"}">${t.contribution > 0 ? "+" : ""}${fmt(t.contribution, 2)}</td></tr>`).join("")}
       </tbody></table><div class="muted small">positive pushes toward synthetic, negative toward human (intercept ${fmt(c.intercept, 2)})</div>`;
   } else {
     f("contrib-card").classList.add("hidden");
   }
-  // semantic
-  if (res.semantic) {
+  // semantic / transcript
+  const liveTurns = res.live && Array.isArray(res.live.caller_turns) ? res.live.caller_turns : null;
+  if (res.semantic || liveTurns) {
     f("sem-card").classList.remove("hidden");
-    const s = res.semantic;
+    const s = res.semantic || {};
     let html = "";
-    if (s.available && s.transcript) {
-      const turns = [...s.transcript.agent.map(t => ({ ...t, who: "agent" })), ...s.transcript.caller.map(t => ({ ...t, who: "caller" }))].sort((a, b) => a.start - b.start);
-      html += `<div class="transcript">${turns.map(t => `<div class="t ${t.who}"><span class="muted small">${fmt(t.start, 1)}s ${t.who.toUpperCase()}</span> ${t.text}</div>`).join("")}</div>`;
-      html += `<div class="muted small">transcription ${fmt(s.stt_seconds, 1)} s${s.llm_seconds ? ", judge " + fmt(s.llm_seconds, 1) + " s" : ""}</div>`;
+    const tr = (s.available && s.transcript) ? s.transcript : (liveTurns ? { agent: [], caller: liveTurns } : null);
+    if (tr) {
+      const turns = [...tr.agent.map(t => ({ ...t, who: "agent" })), ...tr.caller.map(t => ({ ...t, who: "caller" }))].sort((a, b) => a.start - b.start);
+      html += `<div class="transcript">${turns.map(t => `<div class="t ${t.who}"><span class="muted small">${fmt(t.start, 1)}s ${t.who.toUpperCase()}</span> ${esc(t.text)}</div>`).join("")}</div>`;
+      if (s.stt_seconds) html += `<div class="muted small">transcription ${fmt(s.stt_seconds, 1)} s${s.llm_seconds ? ", judge " + fmt(s.llm_seconds, 1) + " s" : ""}</div>`;
     }
     if (s.judge) {
       const j = s.judge;
-      html += `<h2 class="mt">Judge</h2><p><b>synthetic ${pct(j.synthetic_probability)}</b> · fabrication ${pct(j.fabrication_probability)} · LLM style ${pct(j.llm_style_probability)} · repeat-back: ${j.repeat_back}</p><p>${j.rationale}</p>`;
-      if (j.nonexistent_probes && j.nonexistent_probes.length) html += `<ul>${j.nonexistent_probes.map(q => `<li><i>${q.agent_question}</i> → <b>${q.caller_reaction}</b></li>`).join("")}</ul>`;
-      if (j.human_markers && j.human_markers.length) html += `<div class="muted small">human markers: ${j.human_markers.join("; ")}</div>`;
+      html += `<h2 class="mt">Judge</h2><p><b>synthetic ${pct(j.synthetic_probability)}</b> · fabrication ${pct(j.fabrication_probability)} · LLM style ${pct(j.llm_style_probability)} · repeat-back: ${esc(j.repeat_back)}</p><p>${esc(j.rationale)}</p>`;
+      if (j.nonexistent_probes && j.nonexistent_probes.length) html += `<ul>${j.nonexistent_probes.map(q => `<li><i>${esc(q.agent_question)}</i> → <b>${esc(q.caller_reaction)}</b></li>`).join("")}</ul>`;
+      if (j.human_markers && j.human_markers.length) html += `<div class="muted small">human markers: ${esc(j.human_markers.join("; "))}</div>`;
     } else if (s.judge_error) {
-      html += `<div class="muted">judge not run: ${s.judge_error}</div>`;
+      html += `<div class="muted">judge not run: ${esc(s.judge_error)}</div>`;
     } else if (s.error) {
-      html += `<div class="muted">${s.error}</div>`;
+      html += `<div class="muted">${esc(s.error)}</div>`;
     }
     f("sem").innerHTML = html;
   }
@@ -199,9 +230,9 @@ function eventChips(events) {
   return (events || []).slice(0, 80).map(e => `<span>${(lab[e.type] || (x => x.type))(e)}</span>`).join("") || "<span>no turn events</span>";
 }
 
-// inferno-ish colormap
+// flat, warm colormap
 function cmap(v) {
-  const stops = [[0, 0, 4], [40, 11, 84], [101, 21, 110], [159, 42, 99], [212, 72, 66], [245, 125, 21], [250, 193, 39], [252, 255, 164]];
+  const stops = [[10, 9, 8], [46, 30, 42], [96, 46, 66], [150, 66, 66], [196, 104, 60], [222, 156, 60], [236, 205, 110], [240, 232, 200]];
   const x = Math.max(0, Math.min(1, v / 255)) * (stops.length - 1);
   const i = Math.floor(x), t = x - i, a = stops[i], b = stops[Math.min(i + 1, stops.length - 1)];
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
@@ -212,7 +243,7 @@ function drawSpectrogram(canvas, res) {
   const W = canvas.clientWidth || 900, H = 300;
   canvas.width = W * devicePixelRatio; canvas.height = H * devicePixelRatio;
   const ctx = canvas.getContext("2d"); ctx.scale(devicePixelRatio, devicePixelRatio);
-  ctx.fillStyle = "#0b0e13"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#0a0908"; ctx.fillRect(0, 0, W, H);
   const dur = res.duration_seconds || 1;
   const specH = 190, laneY = specH + 8, laneH = 18, evY = laneY + laneH * 2 + 10;
   const X = t => (t / dur) * W;
@@ -224,9 +255,8 @@ function drawSpectrogram(canvas, res) {
     octx.putImageData(img, 0, 0);
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(off, 0, 0, W, specH);
-    // pitch track
     if (ui.f0) {
-      ctx.strokeStyle = "#22d3ee"; ctx.lineWidth = 1.5; ctx.beginPath(); let pen = false;
+      ctx.strokeStyle = "#4cc3d9"; ctx.lineWidth = 1.5; ctx.beginPath(); let pen = false;
       for (const [t, f] of ui.f0) {
         if (f === null) { pen = false; continue; }
         const x = X(t), y = specH - (f / (sp.fmax || 4000)) * specH;
@@ -234,49 +264,32 @@ function drawSpectrogram(canvas, res) {
       }
       ctx.stroke();
     }
-    // breaths
     ctx.fillStyle = "rgba(148,163,184,.55)";
     for (const [s, e] of (ui.breaths || [])) ctx.fillRect(X(s), specH - 12, Math.max(2, X(e) - X(s)), 12);
-    // axis labels
-    ctx.fillStyle = "#8b95a7"; ctx.font = "11px system-ui";
+    ctx.fillStyle = "#a39a89"; ctx.font = "11px 'Monster Friend', monospace";
     ctx.fillText("4 kHz", 4, 12); ctx.fillText("0", 4, specH - 4);
   }
-  // lanes
-  ctx.fillStyle = "#1e2532"; ctx.fillRect(0, laneY, W, laneH); ctx.fillRect(0, laneY + laneH + 2, W, laneH);
-  ctx.fillStyle = "#4f8cff"; for (const [s, e] of (tl.agent || [])) ctx.fillRect(X(s), laneY + 2, Math.max(1, X(e) - X(s)), laneH - 4);
-  ctx.fillStyle = "#ff9f43"; for (const [s, e] of (tl.caller_phrases || tl.caller || [])) ctx.fillRect(X(s), laneY + laneH + 4, Math.max(1, X(e) - X(s)), laneH - 4);
-  ctx.fillStyle = "#8b95a7"; ctx.font = "10px system-ui"; ctx.fillText("agent", 3, laneY + 12); ctx.fillText("caller", 3, laneY + laneH + 14);
-  // events
-  const colors = { response: "#a78bfa", agent_interrupt: "#f472b6", silence_fill: "#fbbf24", backchannel: "#34d399", caller_interrupt: "#f472b6", false_start: "#94a3b8" };
+  ctx.fillStyle = "#24211e"; ctx.fillRect(0, laneY, W, laneH); ctx.fillRect(0, laneY + laneH + 2, W, laneH);
+  ctx.fillStyle = "#6b8fd6"; for (const [s, e] of (tl.agent || [])) ctx.fillRect(X(s), laneY + 2, Math.max(1, X(e) - X(s)), laneH - 4);
+  ctx.fillStyle = "#d69a5c"; for (const [s, e] of (tl.caller_phrases || tl.caller || [])) ctx.fillRect(X(s), laneY + laneH + 4, Math.max(1, X(e) - X(s)), laneH - 4);
+  ctx.fillStyle = "#a39a89"; ctx.font = "10px 'Monster Friend', monospace"; ctx.fillText("agent", 3, laneY + 12); ctx.fillText("caller", 3, laneY + laneH + 14);
+  const colors = { response: "#a78bfa", agent_interrupt: "#e07aa8", silence_fill: "#e0b34a", backchannel: "#5fb98f", caller_interrupt: "#e07aa8", false_start: "#94a3b8" };
   for (const e of (res.events || [])) {
     const c = colors[e.type]; if (!c) continue;
     ctx.fillStyle = c; ctx.fillRect(X(e.t) - 1, evY, 3, 14);
-    if (e.type === "response") { ctx.fillStyle = "#a78bfa"; ctx.font = "10px system-ui"; ctx.fillText(fmt(e.latency, 1), X(e.t) + 3, evY + 11); }
+    if (e.type === "response") { ctx.fillStyle = "#a78bfa"; ctx.font = "10px 'Monster Friend', monospace"; ctx.fillText(fmt(e.latency, 1), X(e.t) + 3, evY + 11); }
   }
-  // time ticks
-  ctx.fillStyle = "#8b95a7"; ctx.font = "10px system-ui";
+  ctx.fillStyle = "#a39a89"; ctx.font = "10px 'Monster Friend', monospace";
   const step = dur > 120 ? 30 : (dur > 40 ? 10 : 5);
   for (let t = 0; t <= dur; t += step) { ctx.fillRect(X(t), H - 14, 1, 4); ctx.fillText(t + "s", X(t) + 2, H - 4); }
 }
 
-// ------------------------------------------------------------------ live call
-const SCRIPT = [
-  { kind: "greeting", text: "Hola, buenas tardes. Le llamo del área de atención a clientes de su banco. ¿Hablo con el titular de la cuenta?", wait: true },
-  { kind: "question", text: "Perfecto. Para continuar, ¿me puede decir su nombre completo y explicarme brevemente el motivo de su llamada?", wait: true,
-    interruptAfter: 2.2, interruptText: "Perdón, disculpe que lo interrumpa. ¿Me lo puede repetir un poco más despacio, por favor?" },
-  { kind: "repeat_back", text: "Le voy a dar un folio de aclaración: siete, cuatro, dos, nueve, uno. ¿Me lo puede repetir, por favor?", wait: true },
-  { kind: "probe_nonexistent", text: "Veo en el sistema que tiene activo el seguro Protección Total Plus asociado a su tarjeta adicional. ¿Me confirma el número de póliza de ese seguro?", wait: true },
-  { kind: "silence", text: "Un momento, por favor.", silence: 5 },
-  { kind: "question", text: "Gracias por esperar. Una última pregunta: ¿cuál es el mejor horario para contactarle?", wait: true },
-  { kind: "closing", text: "Muy bien. Hemos terminado la verificación. Gracias por su tiempo, que tenga un buen día.", wait: false },
-];
-
+// ------------------------------------------------------------------ live call (server-driven agent: Gemini + ElevenLabs)
 const WORKLET_SRC = `
 class PcmCapture extends AudioWorkletProcessor {
-  constructor() { super(); this.buf = []; this.acc = 0; this.ratio = sampleRate / 8000; this.pos = 0; this.last = 0; this.out = []; }
+  constructor() { super(); this.buf = []; this.ratio = sampleRate / 8000; this.pos = 0; this.out = []; }
   process(inputs) {
     const ch = inputs[0] && inputs[0][0]; if (!ch) return true;
-    // moving-average low-pass then linear-interpolation resample to 8 kHz
     const k = Math.max(1, Math.round(this.ratio / 2));
     for (let i = 0; i < ch.length; i++) {
       let s = 0; for (let j = 0; j < k; j++) s += ch[Math.max(0, i - j)]; s /= k;
@@ -300,16 +313,18 @@ registerProcessor("pcm-capture", PcmCapture);`;
 
 class LiveCall {
   constructor() {
-    this.ws = null; this.ctx = null; this.sent = 0; this.speaking = false; this.speechStart = null; this.lastSpeech = 0;
-    this.floor = -60; this.history = []; this.running = false; this.stepIdx = 0; this.voice = null;
+    this.ws = null; this.ctx = null; this.sent = 0; this.speaking = false; this.lastSpeech = 0; this.floor = -60;
+    this.history = []; this.running = false; this.voice = null; this.queue = []; this.playing = false; this.stopping = false;
   }
   t() { return this.sent / 8000; }
-  log(text, kind, you = false) {
-    const d = document.createElement("div"); d.className = "line" + (you ? " you" : "");
-    d.innerHTML = `<span class="kind">${kind}</span>${text}`; $("#agent-log").appendChild(d); d.scrollIntoView({ block: "nearest" });
+  log(text, kind, cls = "") {
+    const d = document.createElement("div"); d.className = "line " + cls;
+    d.innerHTML = `<span class="kind">${esc(kind)}</span>${esc(text)}`; $("#agent-log").appendChild(d); d.scrollIntoView({ block: "nearest" });
   }
+  status(t) { $("#live-status").textContent = t; }
   async start() {
-    $("#live-result").innerHTML = ""; $("#agent-log").innerHTML = ""; $("#live-events").innerHTML = ""; this.history = [];
+    $("#live-result").innerHTML = ""; $("#agent-log").innerHTML = ""; $("#live-events").innerHTML = ""; this.history = []; this.queue = []; this.playing = false; this.stopping = false;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("microphone API unavailable: open the page over https:// or on localhost");
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } });
     this.ctx = new (window.AudioContext || window.webkitAudioContext)();
     await this.ctx.resume();
@@ -321,83 +336,88 @@ class LiveCall {
     src.connect(this.node);
     const proto = location.protocol === "https:" ? "wss" : "ws";
     this.ws = new WebSocket(`${proto}://${location.host}/ws/live`);
-    await new Promise((res, rej) => { this.ws.onopen = res; this.ws.onerror = rej; });
+    await new Promise((res, rej) => { this.ws.onopen = res; this.ws.onerror = () => rej(new Error("websocket connection failed")); });
     this.ws.onmessage = ev => this.onMessage(JSON.parse(ev.data));
+    this.ws.onclose = () => { if (this.running) { this.status("connection closed"); this.cleanup(); } };
     this.node.port.onmessage = ev => this.onPcm(ev.data);
     this.running = true;
-    $("#live-start").disabled = true; $("#live-stop").disabled = false; $("#live-status").textContent = "call in progress";
+    $("#live-start").disabled = true; $("#live-stop").disabled = false; this.status("connecting the agent…");
     this.pickVoice();
-    this.runScript();
+    this.ws.send(JSON.stringify({ type: "start" }));
   }
   pickVoice() {
-    const vs = speechSynthesis.getVoices();
+    const vs = window.speechSynthesis ? speechSynthesis.getVoices() : [];
     this.voice = vs.find(v => /es[-_]MX/i.test(v.lang)) || vs.find(v => /es[-_]US/i.test(v.lang)) || vs.find(v => /^es/i.test(v.lang)) || vs[0] || null;
   }
   onPcm({ pcm, rms }) {
-    if (!this.running) return;
+    if (!this.running || !this.ws || this.ws.readyState !== 1) return;
     this.ws.send(pcm); this.sent += 800;
     const db = 20 * Math.log10(rms + 1e-6);
-    if (!this.speaking) this.floor = Math.min(this.floor * 0.98 + db * 0.02, Math.max(this.floor, db)); // slow floor tracking
-    const thr = Math.max(this.floor + 9, -48);
+    if (!this.speaking && db < this.floor + 6) this.floor = this.floor * 0.95 + db * 0.05;
+    const thr = Math.max(this.floor + 9, -50);
     const now = this.t();
-    if (db > thr) { if (!this.speaking) { this.speaking = true; this.speechStart = now; } this.lastSpeech = now; }
+    if (db > thr) { this.speaking = true; this.lastSpeech = now; }
     else if (this.speaking && now - this.lastSpeech > 0.4) { this.speaking = false; }
     $("#mic-level").style.width = Math.max(0, Math.min(100, (db + 60) * 1.8)) + "%";
     $("#mic-level").style.background = this.speaking ? "var(--caller)" : "var(--human)";
   }
-  say(text, kind) {
+  sendAgent(ev, text, kind) {
+    if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ type: "agent", event: ev, t: this.t(), text, kind }));
+  }
+  // play one agent line: ElevenLabs mp3 from the server, or browser speech synthesis as fallback
+  playLine(m) {
     return new Promise(res => {
-      const send = ev => this.ws && this.ws.readyState === 1 && this.ws.send(JSON.stringify({ type: "agent", event: ev, t: this.t(), text, kind }));
-      this.log(text, kind);
-      if (window.speechSynthesis && this.voice) {
-        const u = new SpeechSynthesisUtterance(text); u.voice = this.voice; u.lang = this.voice.lang; u.rate = 1.0;
-        let started = false;
-        u.onstart = () => { started = true; send("start"); };
-        u.onend = () => { if (!started) send("start"); send("end"); res(); };
-        u.onerror = () => { if (!started) send("start"); send("end"); res(); };
-        speechSynthesis.speak(u);
-        setTimeout(() => { if (!started) { started = true; send("start"); } }, 250);
-      } else { // no TTS: beep for a duration proportional to the text
-        const dur = Math.max(1.2, text.length / 14);
-        send("start");
-        const o = this.ctx.createOscillator(), g = this.ctx.createGain(); g.gain.value = 0.05; o.frequency.value = 440; o.connect(g); g.connect(this.ctx.destination); o.start();
-        setTimeout(() => { o.stop(); send("end"); res(); }, dur * 1000);
+      const kind = m.kind, text = m.text;
+      let started = false;
+      const start = () => { if (!started) { started = true; this.sendAgent("start", text, kind); } };
+      const end = () => { if (!started) start(); this.sendAgent("end", text, kind); res(); };
+      if (m.audio_b64) {
+        const a = new Audio("data:audio/mpeg;base64," + m.audio_b64);
+        a.onplaying = start; a.onended = end; a.onerror = () => { this.log("(audio playback failed, using browser voice)", "note", "note"); this.speak(text, kind, res); };
+        a.play().catch(() => { this.log("(autoplay blocked, using browser voice)", "note", "note"); this.speak(text, kind, res); });
+      } else {
+        this.speak(text, kind, res);
       }
     });
   }
-  sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-  async waitForAnswer(step) {
-    const t0 = this.t(); let spoke = false, interrupted = false;
-    while (this.running) {
-      await this.sleep(100);
-      const now = this.t();
-      if (this.speaking) {
-        spoke = true;
-        if (step.interruptAfter && !interrupted && now - this.speechStart >= step.interruptAfter) {
-          interrupted = true; this.log("(agent interrupts while you speak)", "interrupt");
-          await this.say(step.interruptText, "interrupt");
-        }
-      }
-      if (spoke && !this.speaking && now - this.lastSpeech >= 1.3) return;
-      if (!spoke && now - t0 > 8) { this.log("(no answer heard)", "note"); return; }
-      if (now - t0 > 30) return;
+  speak(text, kind, done) {
+    let started = false;
+    const start = () => { if (!started) { started = true; this.sendAgent("start", text, kind); } };
+    const end = () => { start(); this.sendAgent("end", text, kind); done(); };
+    if (window.speechSynthesis && this.voice) {
+      const u = new SpeechSynthesisUtterance(text); u.voice = this.voice; u.lang = this.voice.lang; u.rate = 1.0;
+      u.onstart = start; u.onend = end; u.onerror = end;
+      speechSynthesis.speak(u);
+      setTimeout(start, 250);
+    } else {
+      const dur = Math.max(1.2, text.length / 14);
+      start();
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain(); g.gain.value = 0.05; o.frequency.value = 440; o.connect(g); g.connect(this.ctx.destination); o.start();
+      setTimeout(() => { o.stop(); end(); }, dur * 1000);
     }
   }
-  async runScript() {
-    await this.sleep(600);
-    for (const step of SCRIPT) {
-      if (!this.running) return;
-      await this.say(step.text, step.kind);
-      if (step.silence) { this.log(`(agent stays silent for ${step.silence} s)`, "silence"); const t0 = this.t(); while (this.running && this.t() - t0 < step.silence) await this.sleep(100); }
-      else if (step.wait) await this.waitForAnswer(step);
+  async enqueue(m) {
+    if (m.kind === "interrupt") { this.log(m.text, "agent interrupts", ""); await this.playLine(m); return; }
+    this.queue.push(m);
+    if (this.playing) return;
+    this.playing = true;
+    while (this.queue.length && this.running) {
+      const line = this.queue.shift();
+      this.log(line.text, `agent · ${line.kind}${line.brain === "gemini" ? " · gemini" : ""}${line.voice === "elevenlabs" ? " · elevenlabs" : ""}`);
+      await this.playLine(line);
+      if (line.silence_after) this.log(`(agent stays silent for ${line.silence_after} s)`, "silence", "note");
     }
-    await this.sleep(800);
-    if (this.running) { $("#live-status").textContent = "script finished — press End call for the final verdict"; }
+    this.playing = false;
   }
   onMessage(m) {
-    if (m.type === "update" && m.result) this.renderUpdate(m.result);
+    if (m.type === "hello") { this.status(`call in progress · agent ${m.gemini ? "Gemini" : "scripted"} · voice ${m.elevenlabs ? "ElevenLabs" : "browser"}`); }
+    else if (m.type === "agent_say") this.enqueue(m);
+    else if (m.type === "caller_said") this.log(m.text, "you", "you");
+    else if (m.type === "status") { if (m.text) this.status(m.text); }
+    else if (m.type === "agent_done") { this.status("agent finished the flow — press End call for the final verdict"); this.log("(the agent hung up)", "note", "note"); }
+    else if (m.type === "update" && m.result) this.renderUpdate(m.result);
     else if (m.type === "final") this.renderFinal(m);
-    else if (m.type === "error") $("#live-status").textContent = "server error: " + m.message;
+    else if (m.type === "error") this.status("server error: " + m.message);
   }
   renderUpdate(r) {
     this.history.push(r.p_synthetic);
@@ -405,15 +425,15 @@ class LiveCall {
     v.textContent = unsure ? "…" : r.verdict; v.className = "verdict-big " + (unsure ? "unsure" : r.verdict.toLowerCase());
     $("#live-conf").textContent = `${pct(r.confidence)} confidence · p=${fmt(r.p_synthetic, 2)} · ${fmt(r.speech_seconds, 1)} s speech · evidence ${pct(r.evidence_level)}`;
     const c = $("#live-spark"), ctx = c.getContext("2d"); ctx.clearRect(0, 0, c.width, c.height);
-    ctx.fillStyle = "#1e2532"; ctx.fillRect(0, 0, c.width, c.height); ctx.strokeStyle = "#3b4252"; ctx.beginPath(); ctx.moveTo(0, c.height / 2); ctx.lineTo(c.width, c.height / 2); ctx.stroke();
-    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.beginPath();
+    ctx.fillStyle = "#0a0908"; ctx.fillRect(0, 0, c.width, c.height); ctx.strokeStyle = "#4a443c"; ctx.beginPath(); ctx.moveTo(0, c.height / 2); ctx.lineTo(c.width, c.height / 2); ctx.stroke();
+    ctx.strokeStyle = "#ece4d3"; ctx.lineWidth = 2; ctx.beginPath();
     this.history.forEach((p, i) => { const x = (i / Math.max(1, this.history.length - 1)) * c.width, y = c.height - p * c.height; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
     ctx.stroke();
-    $("#live-aspects").innerHTML = Object.values(r.aspects).map(a => `<div><span>${a.label}</span><div class="bar"><i style="width:${(a.score || 0) * 100}%;background:${a.score === null ? "#3b4252" : (a.score < 0.4 ? "var(--human)" : (a.score > 0.6 ? "var(--synthetic)" : "var(--warn)"))}"></i></div></div>`).join("");
+    $("#live-aspects").innerHTML = Object.values(r.aspects).map(a => `<div><span>${esc(a.label)}</span><div class="bar"><i style="width:${(a.score || 0) * 100}%;background:${scoreColor(a.score)}"></i></div></div>`).join("");
     $("#live-events").innerHTML = eventChips(r.events);
   }
   renderFinal(m) {
-    $("#live-status").textContent = "final verdict ready";
+    this.status("final verdict ready");
     if (m.result) {
       renderResult(m.result, $("#live-result"), "live call");
       if (m.wav_b64) {
@@ -424,12 +444,15 @@ class LiveCall {
     this.cleanup();
   }
   stop() {
-    if (!this.running) return;
-    this.running = false; speechSynthesis && speechSynthesis.cancel();
-    $("#live-status").textContent = "computing final verdict…"; $("#live-stop").disabled = true;
+    if (!this.running || this.stopping) return;
+    this.stopping = true;
+    if (window.speechSynthesis) speechSynthesis.cancel();
+    this.status("computing final verdict…"); $("#live-stop").disabled = true;
     if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ type: "stop" }));
+    else this.cleanup();
   }
   cleanup() {
+    this.running = false;
     try { this.node && this.node.disconnect(); this.stream && this.stream.getTracks().forEach(t => t.stop()); this.ctx && this.ctx.close(); } catch (e) { /* ignore */ }
     setTimeout(() => this.ws && this.ws.close(), 500);
     $("#live-start").disabled = false; $("#live-stop").disabled = true;
@@ -438,5 +461,5 @@ class LiveCall {
 
 const live = new LiveCall();
 if (window.speechSynthesis) speechSynthesis.onvoiceschanged = () => live.pickVoice();
-$("#live-start").addEventListener("click", async () => { try { await live.start(); } catch (e) { $("#live-status").textContent = "could not start: " + e.message; live.cleanup(); } });
+$("#live-start").addEventListener("click", async () => { try { await live.start(); } catch (e) { live.status("could not start: " + e.message); live.cleanup(); } });
 $("#live-stop").addEventListener("click", () => live.stop());

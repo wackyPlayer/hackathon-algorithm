@@ -130,8 +130,10 @@ carries the base64 clip (any reasonable key works, see above) and whether `confi
 PORT=8010 WORKERS=4 SEMANTIC_MODE=uncertain ANTHROPIC_API_KEY=sk-ant-... ./run.sh
 ```
 
-Environment (see `.env.example`): `MODEL_PATH`, `SEMANTIC_MODE=off|uncertain|always`, `WHISPER_MODEL`,
-`ANTHROPIC_API_KEY`, `ENABLE_EMBEDDINGS`, `SAMPLES_DIR`, `DECISION_THRESHOLD`, `MAX_SECONDS`.
+Environment (see `.env.example`; a `.env` file next to `README.md` is loaded automatically): `MODEL_PATH`,
+`SEMANTIC_MODE=off|uncertain|always`, `WHISPER_MODEL`, `ANTHROPIC_API_KEY`, `ENABLE_EMBEDDINGS`, `SAMPLES_DIR`,
+`DECISION_THRESHOLD`, `MAX_SECONDS`; live agent: `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`,
+`ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL`, `LIVE_WHISPER_MODEL`, `LIVE_ANSWER_TIMEOUT_S`.
 
 Tests: `.venv\Scripts\python.exe -m pytest -q` (14 end-to-end API tests on generated clips, no dataset needed).
 
@@ -152,11 +154,37 @@ and the fallback adds ~2 s per request that has nothing to do with the detector.
   their cues, attack profile, spectrogram with both speaker lanes, response-latency labels, interruption /
   silence-fill / back-channel markers, breath marks, pitch track, model contributions, raw JSON. Batch mode
   runs many files through `/detect` and tabulates verdicts and latency.
-* **Live call with the agent** — the browser plays a bank agent (speech synthesis, Spanish) that runs the
-  same flow as Altur's agent: greeting, a question it deliberately interrupts, a repeat-back folio, a probe
-  about a non-existent insurance product, a 5-second silence, a closing. Your microphone is streamed to
-  the server at 8 kHz; the verdict, aspects and turn events update every 2 s; "End call" returns the full
-  report and the recorded WAV.
+* **Live call with the agent** — you are the caller; the bank agent "Marina" is generated live on the server
+  (`backend/live_agent.py` + the `/ws/live` session in `backend/main.py`):
+  **Gemini** writes every line from what you just said (`GEMINI_API_KEY`, default model `gemini-3.1-flash-lite`,
+  ~1.3 s per line; falls back to `gemini-3.6-flash` with minimal thinking, then to canned Spanish lines),
+  **ElevenLabs** speaks it (`ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID`; without a key the browser's Spanish
+  speech synthesis is used) and **faster-whisper** (`LIVE_WHISPER_MODEL=base`, pre-loaded at start-up) hears
+  you. The flow is the same as Altur's agent: greeting, a question the agent deliberately interrupts after
+  2.5 s of your speech, a folio you repeat back, a probe about an insurance product that does not exist, a
+  5-second silence, a last question, a closing. End-of-turn detection, the interruption and the no-answer
+  timeout (9 s) run server-side on the 8 kHz stream; the browser only captures the microphone and plays the
+  agent's audio, reporting when it starts and stops so the turn timeline is exact. The verdict, aspects and
+  events update every 2 s; "End call" returns the full report, the transcript and the recorded WAV.
+* **Look** — every piece of text uses the *Monster Friend Fore* font (`frontend/fonts/`), square corners,
+  flat colours, hard offset shadows; the confidence / probability bars are plain filled rectangles. The font
+  draws `# $ % & ( ) * + / < = > @ [ ] ^ _ { | } ~` as the Undertale heart, so those characters fall back to
+  the monospace font (`unicode-range` in `style.css`).
+
+## Sharing the dashboard and API with other people
+
+```powershell
+.\run.ps1 -Port 8010          # host: start the server (or python dev_server.py)
+.\share.ps1 -Port 8010        # host: public HTTPS link via a Cloudflare quick tunnel (installs cloudflared with winget)
+```
+
+`share.ps1` / `share.sh` print a `https://….trycloudflare.com` link and write it to `share_url.txt`; the
+**Share link** button in the header then shows and copies it (`GET /share` also lists the LAN address). The
+public link exposes everything a non-host user needs: the dashboard and its static files, `POST /detect`,
+`POST /analyze`, `GET /samples`, the `/ws/live` WebSocket and `GET /health`. CORS is open on every route and
+`HEAD /` is answered, so external tools and uptime checks work too. HTTPS matters: browsers only allow the
+microphone on `https://` or `localhost`, so the live call for other people needs the tunnel link, while the
+analysis endpoints also work over the plain LAN address.
 
 ## Training
 

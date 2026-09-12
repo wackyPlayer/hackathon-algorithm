@@ -4,19 +4,24 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Altur Voice Shield</title>
+<link rel="preload" href="/static/fonts/MonsterFriendFore.otf" as="font" type="font/otf" crossorigin>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header>
   <div class="brand">
-    <span class="logo">◉</span>
+    <span class="logo">&#9673;</span>
     <div>
       <h1>Altur Voice Shield</h1>
       <div class="sub">Real-time synthetic caller detection · caller = channel 0, agent = channel 1</div>
     </div>
   </div>
-  <div id="health" class="pill">connecting…</div>
+  <div class="live-controls">
+    <button id="share-btn" class="hidden">Share link</button>
+    <div id="health" class="pill">connecting…</div>
+  </div>
 </header>
+<div id="share-box" class="card hidden" style="margin:12px 22px 0"></div>
 
 <nav class="tabs">
   <button class="tab active" data-tab="analyze">Analyze recording</button>
@@ -56,9 +61,11 @@
           <span id="live-status" class="muted">idle</span>
           <span class="meter"><span id="mic-level"></span></span>
         </div>
-        <p class="muted small">The bank agent (browser speech synthesis, Spanish) runs the same flow as the Altur agent:
-          it asks you to repeat a folio, asks about a product that does not exist, interrupts you once and goes silent
-          once. Your microphone is streamed to the server at 8 kHz; the verdict updates every 2 seconds.</p>
+        <p class="muted small">You are the caller. The bank agent "Marina" is generated live: Gemini writes each line from what you
+          just said, ElevenLabs speaks it (browser voice if no key is configured), and Whisper on the server hears you.
+          The agent runs the same verification flow as Altur's: greeting, a question it deliberately interrupts, a folio
+          you must repeat back, a probe about an insurance product that does not exist, a 5-second silence, a last
+          question, a closing. Your microphone is streamed at 8 kHz; the verdict updates every 2 seconds.</p>
         <div id="agent-log" class="agent-log"></div>
       </div>
       <div class="card live-verdict">
@@ -79,8 +86,8 @@
       <h2>POST /detect (scored endpoint)</h2>
       <p>Body: JSON with a base64-encoded stereo WAV (any key containing <code>audio</code>, <code>wav</code>,
         <code>clip</code>, <code>data</code> or <code>file</code> is accepted; raw WAV bytes, a bare base64 body and
-        multipart uploads work too).</p>
-<pre>curl -s -X POST http://localhost:8000/detect \
+        multipart uploads work too). CORS is open, so any origin can call it.</p>
+<pre>curl -s -X POST http://127.0.0.1:8000/detect \
   -H "Content-Type: application/json" \
   -d "{\"audio\": \"$(base64 -w0 call.wav)\"}"
 
@@ -88,6 +95,14 @@
       <p><code>confidence</code> is the probability that the returned verdict is correct (0.5 – 1.0). The raw
         <code>p_synthetic</code>, per-aspect scores, attack profile, turn timeline and feature vector are returned by
         <code>POST /analyze</code> (same body; add <code>?semantic=1</code> to force the transcript judge).</p>
+      <h2>Other routes</h2>
+      <p><code>GET /health</code> · <code>GET /samples</code> · <code>POST /analyze?sample=name.wav</code> ·
+        <code>WS /ws/live</code> (live call: int16 8 kHz PCM frames in, agent lines and rolling verdicts out) ·
+        <code>GET /share</code> (public / LAN links for this server).</p>
+      <h2>Sharing</h2>
+      <p>On the host run <code>share.ps1</code> (Windows) or <code>share.sh</code>: it opens a public HTTPS tunnel
+        (Cloudflare quick tunnel, no account needed) and the <b>Share link</b> button appears in the header. HTTPS is
+        required for other people's microphones in the live call; the analysis endpoints also work over the plain LAN address.</p>
       <h2>Health</h2>
       <pre id="health-json">…</pre>
     </div>

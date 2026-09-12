@@ -5,6 +5,29 @@ import os
 from dataclasses import dataclass
 
 
+def _load_dotenv() -> None:
+    """Load KEY=VALUE lines from <project>/.env into the environment (existing variables win)."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, ".env")
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except OSError:
+        pass
+
+
+_load_dotenv()
+
+
 def _b(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -62,6 +85,17 @@ class Settings:
 
     # --- live mode ---
     live_update_interval_s: float = _f("LIVE_UPDATE_INTERVAL_S", 2.0)
+    # live agent: Gemini writes the agent's lines, ElevenLabs speaks them, faster-whisper hears the caller
+    gemini_api_key: str = _s("GEMINI_API_KEY", "")
+    gemini_model: str = _s("GEMINI_MODEL", "gemini-3.1-flash-lite")      # ~1.3 s per line, no thinking
+    gemini_fallback_model: str = _s("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash")
+    elevenlabs_api_key: str = _s("ELEVENLABS_API_KEY", "")
+    elevenlabs_voice_id: str = _s("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")
+    elevenlabs_model: str = _s("ELEVENLABS_MODEL", "eleven_multilingual_v2")
+    live_whisper_model: str = _s("LIVE_WHISPER_MODEL", "base")
+    live_end_silence_s: float = _f("LIVE_END_SILENCE_S", 1.0)      # silence that ends a caller utterance
+    live_min_utterance_s: float = _f("LIVE_MIN_UTTERANCE_S", 0.4)
+    live_answer_timeout_s: float = _f("LIVE_ANSWER_TIMEOUT_S", 9.0)   # agent moves on if the caller says nothing
 
     # --- misc ---
     log_level: str = _s("LOG_LEVEL", "INFO")

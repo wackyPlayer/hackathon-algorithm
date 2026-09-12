@@ -4,7 +4,9 @@ Run:  uvicorn backend.main:app --host 0.0.0.0 --port 8000 --workers 2
 """
 from __future__ import annotations
 
+import asyncio
 import base64
+import csv
 import json
 import logging
 import os
@@ -19,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .audio import b64_to_bytes, call_from_arrays, load_call, looks_like_wav, to_wav_bytes
 from .config import settings
+from .live_agent import STEPS, ElevenLabsVoice, GeminiBrain, elevenlabs_available, gemini_available
 from .scoring.pipeline import Analyzer
 
 logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -36,13 +39,52 @@ async def lifespan(app: FastAPI):
     an = Analyzer()
     an.warmup()
     STATE["analyzer"] = an
-    log.info("analyzer ready in %.1fs (mode=%s, semantic=%s)", time.time() - t0, an.mode, settings.semantic_mode)
+    log.info("analyzer ready in %.1fs (mode=%s, semantic=%s, gemini=%s, elevenlabs=%s)", time.time() - t0, an.mode,
+             settings.semantic_mode, gemini_available(), elevenlabs_available())
+    # pre-load the live agent's speech recogniser so the first caller turn is not delayed by a model download
+    from .features.semantic import get_whisper, whisper_available
+    if whisper_available():
+        import threading
+
+        def _warm():
+            try:
+                get_whisper(settings.live_whisper_model)
+            except Exception as exc:  # pragma: no cover
+                log.warning("live whisper warm-up failed: %s", exc)
+        threading.Thread(target=_warm, name="whisper-warmup", daemon=True).start()
     yield
 
 
-app = FastAPI(title="Altur Voice Shield", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Altur Voice Shield", version="1.1.0", lifespan=lifespan)
+# Open CORS so the dashboard and the API work from any origin (shared tunnel link, other teams' tools, judges).
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["*"])
 if os.path.isdir(FRONTEND):
     app.mount("/static", StaticFiles(directory=FRONTEND), name="static")
+
+
+@app.get("/share")
+async def share(request: Request):
+    """Links other people can use: the public tunnel URL (written by share.ps1 / share.sh or SHARE_URL) and LAN URLs."""
+    public = os.getenv("SHARE_URL", "").strip()
+    if not public:
+        p = os.path.join(ROOT, "share_url.txt")
+        if os.path.exists(p):
+            try:
+                public = open(p, encoding="utf-8").read().strip()
+            except OSError:
+                public = ""
+    port = request.url.port or (443 if request.url.scheme == "https" else 80)
+    lan = []
+    try:
+        import socket
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if not ip.startswith("127.") and not ip.startswith("169.254."):
+                lan.append(f"http://{ip}:{port}")
+    except Exception:
+        pass
+    return {"public_url": public or None, "lan_urls": lan, "https_required_for_mic": True}
 
 
 # ----------------------------------------------------------------------------- input parsing
@@ -146,8 +188,7 @@ async def analyze(request: Request, semantic: int = 0, ui: int = 1, sample: str 
     `sample=<name>` analyses a file from SAMPLES_DIR instead of the request body (demo convenience)."""
     STATE["requests"] += 1
     if sample:
-        path = _sample_path(sample)
-        data = open(path, "rb").read()
+        data = open(_sample_path(sample), "rb").read()
     else:
         data = await read_audio_bytes(request)
     call = _load(data)
@@ -155,6 +196,38 @@ async def analyze(request: Request, semantic: int = 0, ui: int = 1, sample: str 
     if sample:
         res["sample"] = {"name": sample, **SAMPLE_LABELS.get(os.path.splitext(sample)[0], {})}
     return JSONResponse(res)
+
+
+@app.get("/health")
+async def health():
+    an: Analyzer | None = STATE["analyzer"]
+    from .features.semantic import claude_available, whisper_available
+    det = an.detector if an else None
+    return {
+        "status": "ok" if an else "starting",
+        "mode": an.mode if an else None,
+        "model_path": settings.model_path if det else None,
+        "model_meta": {k: v for k, v in (det.meta.items() if det else []) if not isinstance(v, (list, dict))},
+        "semantic_mode": settings.semantic_mode,
+        "whisper_available": whisper_available(),
+        "claude_available": claude_available(),
+        "gemini_available": gemini_available(),
+        "gemini_model": settings.gemini_model,
+        "elevenlabs_available": elevenlabs_available(),
+        "live_whisper_model": settings.live_whisper_model,
+        "embeddings_enabled": settings.enable_embeddings,
+        "uptime_s": round(time.time() - STATE["started"], 1),
+        "requests": STATE["requests"],
+        "confidence_semantics": "probability that the returned is_synthetic verdict is correct (0.5-1.0)",
+    }
+
+
+@app.api_route("/", methods=["GET", "HEAD"])
+async def index():
+    p = os.path.join(FRONTEND, "index.html")
+    if not os.path.exists(p):
+        return JSONResponse({"service": "altur-voice-shield", "endpoints": ["/detect", "/analyze", "/health", "/ws/live"]})
+    return FileResponse(p)
 
 
 # ----------------------------------------------------------------------------- demo samples (optional)
@@ -165,7 +238,6 @@ if SAMPLES_DIR:
     for cand in (os.getenv("SAMPLES_MANIFEST", ""), os.path.join(SAMPLES_DIR, "manifest.csv"),
                  os.path.join(os.path.dirname(SAMPLES_DIR.rstrip("/\\")), "manifest.csv")):
         if cand and os.path.exists(cand):
-            import csv
             for r in csv.DictReader(open(cand, encoding="utf-8")):
                 SAMPLE_LABELS[r.get("anon_id") or r.get("file", "").replace(".wav", "")] = \
                     {"label": r.get("label"), "split": r.get("split"), "duration_s": r.get("duration_s")}
@@ -190,57 +262,72 @@ async def samples(limit: int = 400):
     return {"enabled": True, "samples": [{"name": n, **SAMPLE_LABELS.get(os.path.splitext(n)[0], {})} for n in names]}
 
 
-@app.get("/health")
-async def health():
-    an: Analyzer | None = STATE["analyzer"]
-    from .features.semantic import claude_available, whisper_available
-    det = an.detector if an else None
-    return {
-        "status": "ok" if an else "starting",
-        "mode": an.mode if an else None,
-        "model_path": settings.model_path if det else None,
-        "model_meta": {k: v for k, v in (det.meta.items() if det else []) if not isinstance(v, (list, dict))},
-        "semantic_mode": settings.semantic_mode,
-        "whisper_available": whisper_available(),
-        "claude_available": claude_available(),
-        "embeddings_enabled": settings.enable_embeddings,
-        "uptime_s": round(time.time() - STATE["started"], 1),
-        "requests": STATE["requests"],
-        "confidence_semantics": "probability that the returned is_synthetic verdict is correct (0.5-1.0)",
-    }
-
-
-@app.get("/")
-async def index():
-    p = os.path.join(FRONTEND, "index.html")
-    if not os.path.exists(p):
-        return JSONResponse({"service": "altur-voice-shield", "endpoints": ["/detect", "/analyze", "/health", "/ws/live"]})
-    return FileResponse(p)
-
-
 # ----------------------------------------------------------------------------- live call (WebSocket)
 
 class LiveSession:
-    """Accumulates caller PCM (int16 mono 8 kHz) and the agent's spoken timeline from the browser."""
+    """One live call: caller PCM (int16 mono 8 kHz) from the browser, agent lines from Gemini/ElevenLabs.
 
-    def __init__(self):
+    The browser only captures the microphone and plays the agent's audio; the conversation state machine,
+    the caller's end-of-utterance detection and the speech recognition all live here."""
+
+    def __init__(self, ws: WebSocket, analyzer: Analyzer):
+        self.ws, self.an = ws, analyzer
         self.chunks: list = []
         self.n = 0
         self.agent_events: list = []       # {"event": start|end, "t": float, "text": str, "kind": str}
         self.last_analyzed = 0
         self.started = time.time()
+        # agent state machine
+        self.brain = GeminiBrain()
+        self.voice = ElevenLabsVoice()
+        self.step = 0                      # index into STEPS of the line being spoken / answered
+        self.await_answer = False
+        self.agent_speaking = False
+        self.busy = False
+        self.done = False
+        self.interrupted_step = -1
+        self.timer: asyncio.Task | None = None
+        self.pipeline: asyncio.Task | None = None
+        # caller utterance detection (100 ms blocks)
+        self.floor_db = -60.0
+        self.speaking = False
+        self.utt_start: float | None = None
+        self.last_speech: float | None = None
+        self.caller_turns: list = []
 
-    def add(self, data: bytes) -> None:
-        x = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
-        self.chunks.append(x)
-        self.n += len(x)
+    # ---------------------------------------------------------------- audio in
+    def seconds(self) -> float:
+        return self.n / 8000.0
 
     def audio(self) -> np.ndarray:
         return np.concatenate(self.chunks) if self.chunks else np.zeros(0, np.float32)
 
-    def seconds(self) -> float:
-        return self.n / 8000.0
+    def add(self, data: bytes) -> list:
+        """Append PCM; return finalized caller utterances [(start_s, end_s)] detected in this chunk."""
+        x = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
+        self.chunks.append(x)
+        finished = []
+        for i in range(0, len(x), 800):
+            blk = x[i:i + 800]
+            if len(blk) < 400:
+                break
+            t = (self.n + i) / 8000.0
+            db = 20 * np.log10(float(np.sqrt(np.mean(blk ** 2))) + 1e-6)
+            if not self.speaking and db < self.floor_db + 6:
+                self.floor_db = 0.95 * self.floor_db + 0.05 * db
+            thr = max(self.floor_db + 9.0, -50.0)
+            if db > thr:
+                if not self.speaking:
+                    self.speaking, self.utt_start = True, t
+                self.last_speech = t
+            elif self.speaking and self.last_speech is not None and t - self.last_speech >= settings.live_end_silence_s:
+                self.speaking = False
+                if self.last_speech - self.utt_start >= settings.live_min_utterance_s:
+                    finished.append((self.utt_start, self.last_speech + 0.15))
+        self.n += len(x)
+        return finished
 
+    # ---------------------------------------------------------------- agent timeline helpers
     def agent_segments(self) -> list:
         segs, open_t = [], None
         for ev in self.agent_events:
@@ -273,35 +360,159 @@ class LiveSession:
                 a[i:j] = rng.standard_normal(j - i).astype(np.float32) * 0.03
         return a
 
+    # ---------------------------------------------------------------- messaging
+    async def send(self, payload: dict) -> None:
+        try:
+            await self.ws.send_text(json.dumps(payload))
+        except Exception as exc:  # pragma: no cover
+            log.debug("ws send failed: %s", exc)
+
+    async def status(self, text: str) -> None:
+        await self.send({"type": "status", "text": text})
+
+    # ---------------------------------------------------------------- conversation flow
+    def cancel_timer(self) -> None:
+        if self.timer is not None and not self.timer.done():
+            self.timer.cancel()
+        self.timer = None
+
+    async def speak_step(self, caller_text: str) -> None:
+        """Generate (Gemini) + synthesize (ElevenLabs) the current step's line and hand it to the browser."""
+        if self.done or self.step >= len(STEPS):
+            return
+        self.busy = True
+        self.await_answer = False
+        self.cancel_timer()
+        step = STEPS[self.step]
+        try:
+            await self.status("thinking…")
+            text = await run_in_threadpool(self.brain.line, self.step, caller_text)
+            await self.status("synthesizing…")
+            audio = await run_in_threadpool(self.voice.synthesize, text)
+            await self.send({"type": "agent_say", "step": self.step + 1, "steps": len(STEPS), "kind": step["kind"],
+                             "text": text, "audio_b64": base64.b64encode(audio).decode("ascii") if audio else None,
+                             "silence_after": step.get("silence_after", 0), "end": bool(step.get("end")),
+                             "brain": "gemini" if (self.brain.enabled and not self.brain.last_error) else "canned",
+                             "voice": "elevenlabs" if audio else "browser"})
+            await self.status("")
+        except Exception as exc:  # pragma: no cover
+            log.exception("speak_step failed: %s", exc)
+            await self.send({"type": "error", "message": f"agent failed: {exc}"})
+        finally:
+            self.busy = False
+
+    async def on_agent_event(self, ev: dict) -> None:
+        self.agent_events.append(ev)
+        if ev["event"] == "start":
+            self.agent_speaking = True
+            return
+        self.agent_speaking = False
+        if ev.get("kind") == "interrupt" or self.done:
+            return
+        step = STEPS[min(self.step, len(STEPS) - 1)]
+        if step.get("end"):
+            self.done = True
+            await self.send({"type": "agent_done"})
+        elif step.get("silence_after"):
+            async def later():
+                await asyncio.sleep(step["silence_after"])
+                self.step += 1
+                await self.speak_step("")
+            self.cancel_timer()
+            self.timer = asyncio.create_task(later())
+        else:
+            self.await_answer = True
+            self.cancel_timer()
+            self.timer = asyncio.create_task(self.answer_timeout())
+
+    async def answer_timeout(self) -> None:
+        await asyncio.sleep(settings.live_answer_timeout_s)
+        while self.speaking or self.busy:         # caller mid-sentence or a transcription in flight: wait
+            await asyncio.sleep(0.3)
+        if self.await_answer and not self.busy and not self.done:
+            log.info("live: no answer within %.0fs, agent moves on", settings.live_answer_timeout_s)
+            await self.send({"type": "caller_said", "text": "(no se escuchó respuesta)", "t": round(self.seconds(), 2)})
+            self.step += 1
+            await self.speak_step("")
+
+    async def on_utterance(self, s: float, e: float) -> None:
+        if not self.await_answer or self.busy or self.done:
+            return
+        x = self.audio()[int(s * 8000):int(e * 8000)]
+        # hold the turn while transcribing so the no-answer timer cannot advance the flow underneath us
+        self.busy = True
+        self.await_answer = False
+        self.cancel_timer()
+        await self.status("transcribing…")
+        from .features.semantic import transcribe_array
+        t0 = time.time()
+        text = await run_in_threadpool(transcribe_array, x, settings.live_whisper_model)
+        log.info("live stt %.1fs of audio in %.1fs: %s", e - s, time.time() - t0, text[:80])
+        self.busy = False
+        if self.done:
+            return
+        if not text.strip():
+            await self.status("")
+            self.await_answer = True
+            self.timer = asyncio.create_task(self.answer_timeout())
+            return
+        self.caller_turns.append({"start": round(s, 2), "end": round(e, 2), "text": text})
+        await self.send({"type": "caller_said", "text": text, "t": round(s, 2)})
+        self.step += 1
+        await self.speak_step(text)
+
+    async def maybe_interrupt(self) -> None:
+        """Deliberately talk over the caller once, during the step that asks for a long answer."""
+        if self.done or self.busy or not self.await_answer or self.agent_speaking or not self.speaking:
+            return
+        step = STEPS[min(self.step, len(STEPS) - 1)]
+        after = step.get("interrupt_after")
+        if not after or self.interrupted_step == self.step or self.utt_start is None:
+            return
+        if self.seconds() - self.utt_start < after:
+            return
+        self.interrupted_step = self.step
+        text = step["interrupt_text"]
+        audio = await run_in_threadpool(self.voice.synthesize, text)
+        await self.send({"type": "agent_say", "step": self.step + 1, "steps": len(STEPS), "kind": "interrupt", "text": text,
+                         "audio_b64": base64.b64encode(audio).decode("ascii") if audio else None, "silence_after": 0,
+                         "end": False, "brain": "canned", "voice": "elevenlabs" if audio else "browser"})
+
+    async def analyze(self, final: bool):
+        x = self.audio()
+        if len(x) < 8000:
+            return None
+        call = call_from_arrays(x, None)
+        segs = self.agent_segments()
+        res = await run_in_threadpool(self.an.analyze, call, segs, self.agent_text_turns(), final, final, False)
+        res["live"] = {"seconds": round(self.seconds(), 1), "agent_turns": len(segs), "step": self.step,
+                       "caller_turns": self.caller_turns if final else len(self.caller_turns),
+                       "brain": "gemini" if self.brain.enabled else "canned", "voice": "elevenlabs" if self.voice.enabled else "browser"}
+        return res
+
 
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket):
     await ws.accept()
-    sess = LiveSession()
-    an: Analyzer = STATE["analyzer"]
+    sess = LiveSession(ws, STATE["analyzer"])
     interval = settings.live_update_interval_s
-
-    async def run_analysis(final: bool):
-        x = sess.audio()
-        if len(x) < 8000:
-            return None
-        call = call_from_arrays(x, None)
-        segs = sess.agent_segments()
-        res = await run_in_threadpool(an.analyze, call, segs, sess.agent_text_turns(), final, final, False)
-        res["live"] = {"seconds": round(sess.seconds(), 1), "agent_turns": len(segs)}
-        return res
-
-    import asyncio
     inflight: dict = {"task": None}
 
     async def update_task():
         try:
-            res = await run_analysis(final=False)
+            res = await sess.analyze(final=False)
             if res:
                 res.pop("features", None)
-                await ws.send_text(json.dumps({"type": "update", "result": res}))
+                res.pop("ui", None)
+                await sess.send({"type": "update", "result": res})
         except Exception as exc:  # pragma: no cover
             log.warning("live update failed: %s", exc)
+
+    def spawn_pipeline(coro):
+        if sess.pipeline is not None and not sess.pipeline.done():
+            coro.close()
+            return
+        sess.pipeline = asyncio.create_task(coro)
 
     try:
         while True:
@@ -309,8 +520,10 @@ async def ws_live(ws: WebSocket):
             if msg.get("type") == "websocket.disconnect":
                 break
             if msg.get("bytes"):
-                sess.add(msg["bytes"])
-                # keep reading (so protocol pings are answered); run at most one analysis at a time
+                for s, e in sess.add(msg["bytes"]):
+                    spawn_pipeline(sess.on_utterance(s, e))
+                if sess.speaking:
+                    spawn_pipeline(sess.maybe_interrupt())
                 if sess.n - sess.last_analyzed >= interval * 8000 and (inflight["task"] is None or inflight["task"].done()):
                     sess.last_analyzed = sess.n
                     inflight["task"] = asyncio.create_task(update_task())
@@ -320,24 +533,33 @@ async def ws_live(ws: WebSocket):
                 except Exception:
                     continue
                 t = m.get("type")
-                if t == "agent":
-                    sess.agent_events.append({"event": m.get("event"), "t": float(m.get("t", sess.seconds())),
-                                              "text": m.get("text", ""), "kind": m.get("kind", "")})
+                if t == "start":
+                    await sess.send({"type": "hello", "gemini": sess.brain.enabled, "elevenlabs": sess.voice.enabled,
+                                     "steps": [s["kind"] for s in STEPS]})
+                    spawn_pipeline(sess.speak_step(""))
+                elif t == "agent":
+                    await sess.on_agent_event({"event": m.get("event"), "t": float(m.get("t", sess.seconds())),
+                                               "text": m.get("text", ""), "kind": m.get("kind", "")})
                 elif t == "stop":
-                    if inflight["task"] is not None and not inflight["task"].done():
-                        await inflight["task"]
-                    res = await run_analysis(final=True)
+                    sess.done = True
+                    sess.cancel_timer()
+                    for task in (inflight["task"], sess.pipeline):
+                        if task is not None and not task.done():
+                            try:
+                                await asyncio.wait_for(task, timeout=30)
+                            except Exception:
+                                pass
+                    res = await sess.analyze(final=True)
                     payload = {"type": "final", "result": res}
                     if res is not None:
                         payload["wav_b64"] = base64.b64encode(to_wav_bytes(sess.audio(), sess.agent_track())).decode("ascii")
-                    await ws.send_text(json.dumps(payload))
+                    await sess.send(payload)
                 elif t == "ping":
-                    await ws.send_text(json.dumps({"type": "pong", "seconds": sess.seconds()}))
+                    await sess.send({"type": "pong", "seconds": sess.seconds()})
     except WebSocketDisconnect:
         pass
     except Exception as exc:  # pragma: no cover
         log.exception("live session error: %s", exc)
-        try:
-            await ws.send_text(json.dumps({"type": "error", "message": str(exc)}))
-        except Exception:
-            pass
+        await sess.send({"type": "error", "message": str(exc)})
+    finally:
+        sess.cancel_timer()

@@ -91,16 +91,38 @@ def _has_profile() -> bool:
     return os.path.isdir(os.path.expanduser("~/.config/anthropic"))
 
 
-def _get_whisper():
-    global _whisper
+_whisper_models: dict = {}
+
+
+def get_whisper(model_name: str | None = None):
+    """Lazily load (and cache) a faster-whisper model by size, e.g. 'base' for the live agent."""
+    name = model_name or settings.whisper_model
     with _whisper_lock:
-        if _whisper is None:
+        if name not in _whisper_models:
             fw = _import_faster_whisper()
             t0 = time.time()
-            _whisper = fw.WhisperModel(settings.whisper_model, device=settings.whisper_device,
-                                       compute_type=settings.whisper_compute_type)
-            log.info("loaded faster-whisper %s in %.1fs", settings.whisper_model, time.time() - t0)
-        return _whisper
+            _whisper_models[name] = fw.WhisperModel(name, device=settings.whisper_device,
+                                                    compute_type=settings.whisper_compute_type)
+            log.info("loaded faster-whisper %s in %.1fs", name, time.time() - t0)
+        return _whisper_models[name]
+
+
+def _get_whisper():
+    return get_whisper(settings.whisper_model)
+
+
+def transcribe_array(x8k: np.ndarray, model_name: str | None = None) -> str:
+    """Transcribe one short 8 kHz utterance (live agent). Returns '' on silence/failure."""
+    if len(x8k) < 2400:
+        return ""
+    try:
+        model = get_whisper(model_name)
+        segs, _ = model.transcribe(resample(x8k, 8000, 16000), language="es", beam_size=1, vad_filter=False,
+                                   condition_on_previous_text=False)
+        return " ".join(sg.text.strip() for sg in segs).strip()
+    except Exception as exc:  # pragma: no cover
+        log.warning("live transcription failed: %s", exc)
+        return ""
 
 
 def transcribe(x8k: np.ndarray, segments: list, max_seconds: float) -> list:

@@ -16,5 +16,6 @@ turns/
 
 # large / local artefacts
 *.log
+share_url.txt
 .DS_Store
 Thumbs.db
