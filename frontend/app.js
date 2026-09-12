@@ -397,15 +397,18 @@ class LiveCall {
     }
   }
   async enqueue(m) {
-    if (m.kind === "interrupt") { this.log(m.text, "agent interrupts", ""); await this.playLine(m); return; }
+    if (m.kind === "interrupt") { this.log(m.text, "agent interrupts", ""); this.status("agent interrupts you…"); await this.playLine(m); this.status("listening…"); return; }
     this.queue.push(m);
     if (this.playing) return;
     this.playing = true;
     while (this.queue.length && this.running) {
       const line = this.queue.shift();
       this.log(line.text, `agent · ${line.kind}${line.brain === "gemini" ? " · gemini" : ""}${line.voice === "elevenlabs" ? " · elevenlabs" : ""}`);
+      this.status("agent speaking…");
       await this.playLine(line);
-      if (line.silence_after) this.log(`(agent stays silent for ${line.silence_after} s)`, "silence", "note");
+      if (line.silence_after) { this.log(`(agent stays silent for ${line.silence_after} s)`, "silence", "note"); this.status("agent is silent…"); }
+      else if (line.end) this.status("agent said goodbye…");
+      else this.status("listening…");
     }
     this.playing = false;
   }

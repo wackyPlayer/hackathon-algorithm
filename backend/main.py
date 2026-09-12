@@ -372,7 +372,8 @@ class LiveSession:
 
     # ---------------------------------------------------------------- conversation flow
     def cancel_timer(self) -> None:
-        if self.timer is not None and not self.timer.done():
+        # never cancel the task we are running in (the timer itself calls speak_step after a timeout / silence)
+        if self.timer is not None and not self.timer.done() and self.timer is not asyncio.current_task():
             self.timer.cancel()
         self.timer = None
 
