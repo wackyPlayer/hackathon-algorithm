@@ -1,7 +1,7 @@
 """Judge-style benchmark: POST base64 WAVs to /detect, measure latency and accuracy.
 
-    python -m bench.benchmark --url http://localhost:8000/detect --audio <dir> --manifest manifest.csv --split val
-    python -m bench.benchmark --url http://localhost:8000/detect --dir clips/   (no labels: just verdicts + latency)
+    python -m bench.benchmark --url http://127.0.0.1:8000/detect --audio <dir> --manifest manifest.csv --split val
+    python -m bench.benchmark --url http://127.0.0.1:8000/detect --dir clips/   (no labels: just verdicts + latency)
 
 Options: --limit N, --clip SECONDS (send only the first N seconds), --field audio (JSON key), --concurrency K
 """
@@ -48,7 +48,7 @@ def auc_rank(y, s):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default="http://localhost:8000/detect")
+    ap.add_argument("--url", default="http://127.0.0.1:8000/detect")
     ap.add_argument("--audio", default="")
     ap.add_argument("--manifest", default="")
     ap.add_argument("--dir", default="")

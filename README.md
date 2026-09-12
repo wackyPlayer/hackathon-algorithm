@@ -15,9 +15,13 @@ endpoint, and ships an analysis dashboard with a live-call mode.
 | First 30 s only | 98.6 % | 0.975 | 1.5 % | 0.015 | 1 miss, 0 false alarms |
 
 Grouped 5-fold cross-validation on the train split (282 calls, folds never share a caller): AUC 1.000.
-Latency of `/detect` on a laptop CPU: ~1.3 s for a full 2.5-minute call, ~0.3 s for a 20 s clip
-(see `bench/benchmark.py`; the number that matters for the judges' "how fast" criterion is that **30–60 s
-of audio is enough for the full accuracy**).
+Latency of `/detect` end-to-end over HTTP on a laptop CPU (16 threads, one worker): ~1.3 s for a full
+2.5-minute call, 0.3 s for a 20 s clip. The number that matters for the judges' "how fast" criterion is that
+**30–60 s of audio is enough for the full accuracy**; the live mode gives a rolling verdict every 2 s.
+
+The deployed `models/detector.joblib` is refit on train + val, so running `bench/benchmark.py` on the val
+split reproduces the endpoint contract and latency but is *not* a generalisation estimate; the table above
+(from `training/train.py`, val untouched) is.
 
 ## How it works — three signal families, one calibrated decision
 
@@ -134,9 +138,13 @@ Tests: `.venv\Scripts\python.exe -m pytest -q` (14 end-to-end API tests on gener
 Judge-style benchmark against a running server:
 
 ```bash
-python -m bench.benchmark --url http://localhost:8000/detect --audio audio/ --manifest manifest.csv --split val
+python -m bench.benchmark --url http://127.0.0.1:8000/detect --audio audio/ --manifest manifest.csv --split val
 python -m bench.benchmark ... --clip 30          # send only the first 30 s of every call
+python -m bench.benchmark ... --concurrency 4    # parallel requests (run the server with --workers 4)
 ```
+
+Use `127.0.0.1`, not `localhost`, for local clients on Windows: Python resolves `localhost` to IPv6 first
+and the fallback adds ~2 s per request that has nothing to do with the detector.
 
 ## Dashboard
 
