@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Altur Voice Shield</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo">◉</span>
+    <div>
+      <h1>Altur Voice Shield</h1>
+      <div class="sub">Real-time synthetic caller detection · caller = channel 0, agent = channel 1</div>
+    </div>
+  </div>
+  <div id="health" class="pill">connecting…</div>
+</header>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="analyze">Analyze recording</button>
+  <button class="tab" data-tab="live">Live call with the agent</button>
+  <button class="tab" data-tab="api">API</button>
+</nav>
+
+<main>
+  <!-- ------------------------------------------------------------------ analyze -->
+  <section id="tab-analyze" class="tabpane active">
+    <div class="row">
+      <div id="drop" class="drop">
+        <input id="file" type="file" accept=".wav,audio/wav,audio/x-wav" hidden>
+        <div class="drop-title">Drop a call recording here (WAV, 8 kHz stereo) or click to choose</div>
+        <div class="drop-sub">Mono files are analysed as caller-only. Other sample rates are resampled.</div>
+      </div>
+      <div class="options">
+        <label><input id="opt-semantic" type="checkbox"> Run semantic layer (transcribe + LLM judge, slower)</label>
+        <label><input id="opt-batch" type="checkbox"> Batch mode: run every dropped file through <code>/detect</code> only</label>
+        <div id="samples-box" class="hidden">
+          <label>Or pick a dataset call: <select id="sample"></select> <button id="sample-go">Analyze</button></label>
+        </div>
+        <div id="progress" class="muted"></div>
+      </div>
+    </div>
+    <div id="batch" class="card hidden"></div>
+    <div id="result"></div>
+  </section>
+
+  <!-- ------------------------------------------------------------------ live -->
+  <section id="tab-live" class="tabpane">
+    <div class="row">
+      <div class="card grow">
+        <div class="live-controls">
+          <button id="live-start" class="primary">Start call</button>
+          <button id="live-stop" disabled>End call &amp; get verdict</button>
+          <span id="live-status" class="muted">idle</span>
+          <span class="meter"><span id="mic-level"></span></span>
+        </div>
+        <p class="muted small">The bank agent (browser speech synthesis, Spanish) runs the same flow as the Altur agent:
+          it asks you to repeat a folio, asks about a product that does not exist, interrupts you once and goes silent
+          once. Your microphone is streamed to the server at 8 kHz; the verdict updates every 2 seconds.</p>
+        <div id="agent-log" class="agent-log"></div>
+      </div>
+      <div class="card live-verdict">
+        <div class="verdict-label muted">rolling verdict</div>
+        <div id="live-verdict" class="verdict-big">—</div>
+        <div id="live-conf" class="muted">waiting for speech…</div>
+        <canvas id="live-spark" width="320" height="80"></canvas>
+        <div id="live-aspects" class="mini-aspects"></div>
+      </div>
+    </div>
+    <div id="live-events" class="card events"></div>
+    <div id="live-result"></div>
+  </section>
+
+  <!-- ------------------------------------------------------------------ api -->
+  <section id="tab-api" class="tabpane">
+    <div class="card">
+      <h2>POST /detect (scored endpoint)</h2>
+      <p>Body: JSON with a base64-encoded stereo WAV (any key containing <code>audio</code>, <code>wav</code>,
+        <code>clip</code>, <code>data</code> or <code>file</code> is accepted; raw WAV bytes, a bare base64 body and
+        multipart uploads work too).</p>
+<pre>curl -s -X POST http://localhost:8000/detect \
+  -H "Content-Type: application/json" \
+  -d "{\"audio\": \"$(base64 -w0 call.wav)\"}"
+
+{"is_synthetic": true, "confidence": 0.93}</pre>
+      <p><code>confidence</code> is the probability that the returned verdict is correct (0.5 – 1.0). The raw
+        <code>p_synthetic</code>, per-aspect scores, attack profile, turn timeline and feature vector are returned by
+        <code>POST /analyze</code> (same body; add <code>?semantic=1</code> to force the transcript judge).</p>
+      <h2>Health</h2>
+      <pre id="health-json">…</pre>
+    </div>
+  </section>
+</main>
+
+<template id="tpl-result">
+  <div class="card verdict-card">
+    <div class="verdict-main">
+      <div class="verdict-big" data-f="verdict">—</div>
+      <div class="verdict-meta">
+        <div><b data-f="confidence"></b> confidence · p(synthetic) = <span data-f="p"></span></div>
+        <div class="muted small" data-f="meta"></div>
+      </div>
+    </div>
+    <div class="pbar"><div class="pfill" data-f="pfill"></div><div class="pmark"></div></div>
+    <div class="pbar-labels"><span>human</span><span>synthetic</span></div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h2>Voice &amp; behaviour rating <span class="muted small">(0 = human-like, 100 = synthetic-like)</span></h2>
+      <div data-f="aspects" class="aspects"></div>
+    </div>
+    <div class="card">
+      <h2>Attack profile <span class="muted small">(share of the synthetic probability)</span></h2>
+      <div data-f="attacks" class="attacks"></div>
+      <h2 class="mt">Signals</h2>
+      <div data-f="signals" class="signals"></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Caller spectrogram &amp; turn timeline</h2>
+    <canvas data-f="spec" class="spec"></canvas>
+    <div class="legend">
+      <span><i class="sw agent"></i>agent speaking</span><span><i class="sw caller"></i>caller speaking</span>
+      <span><i class="sw ev-response"></i>response latency</span><span><i class="sw ev-interrupt"></i>agent interrupts</span>
+      <span><i class="sw ev-fill"></i>caller fills silence</span><span><i class="sw ev-back"></i>back-channel</span>
+      <span><i class="sw breath"></i>breath</span><span><i class="sw f0"></i>pitch track</span>
+    </div>
+    <div data-f="events" class="events"></div>
+  </div>
+  <div class="card" data-f="contrib-card">
+    <h2>Why the model decided <span class="muted small">(logit contributions, trained model)</span></h2>
+    <div data-f="contrib"></div>
+  </div>
+  <div class="card hidden" data-f="sem-card">
+    <h2>Transcript &amp; semantic judge</h2>
+    <div data-f="sem"></div>
+  </div>
+  <details class="card"><summary>Raw JSON</summary><pre data-f="raw"></pre></details>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

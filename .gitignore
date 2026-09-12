@@ -1,0 +1,20 @@
+# environments / caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+
+# dataset (provided for HackMTY 2026 only - never redistribute) and derived tables
+audio/
+data/
+clips/
+*.wav
+*.zip
+manifest.csv
+turns/
+
+# large / local artefacts
+*.log
+.DS_Store
+Thumbs.db
