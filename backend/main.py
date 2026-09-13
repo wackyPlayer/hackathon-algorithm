@@ -85,11 +85,21 @@ async def share(request: Request):
                 public = open(p, encoding="utf-8").read().strip()
             except OSError:
                 public = ""
-    scheme = request.url.scheme
-    port = request.url.port or (443 if scheme == "https" else 80)
+    # cloudflared rewrites the Host header to the origin it forwards to, so behind a tunnel the server
+    # cannot see its own public name -- which is why share.ps1 / share.sh write share_url.txt (or set
+    # SHARE_URL): that file is the only reliable source for the public link. A reverse proxy that does
+    # preserve the original host (X-Forwarded-Host) is used when it is there.
     from .tls import lan_addresses
-    lan = [f"{scheme}://{ip}:{port}" for ip in lan_addresses()]
-    tls_on = scheme == "https"
+    fwd_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+    scheme = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip() or request.url.scheme
+    if not public and fwd_host:
+        public = f"{scheme}://{fwd_host}"
+    # The port we are actually bound to. request.url.port is the *proxy's* port behind a tunnel (443),
+    # and pairing that with a LAN IP produced links like https://10.0.0.5:443 that go nowhere.
+    port = int(os.getenv("DETECTOR_PORT") or 0) or request.url.port or (443 if scheme == "https" else 80)
+    local_scheme = "https" if os.getenv("DETECTOR_TLS") == "1" else "http"
+    lan = [f"{local_scheme}://{ip}:{port}" for ip in lan_addresses()]
+    tls_on = local_scheme == "https"
     if public:
         best, why = public, "public link over HTTPS: dashboard, API and the live call all work anywhere"
     elif tls_on and lan:

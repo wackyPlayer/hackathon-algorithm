@@ -44,6 +44,9 @@ if __name__ == "__main__":
             break
     import uvicorn
     print(f"samples: {os.environ.get('SAMPLES_DIR', '-')}  manifest: {os.environ.get('SAMPLES_MANIFEST', '-')}", file=sys.stderr)
+    # /share needs the port we actually bind to: behind a tunnel the request only carries the proxy's port.
+    os.environ["DETECTOR_PORT"] = str(a.port)
+    os.environ["DETECTOR_TLS"] = "1" if a.https else "0"
     ssl: dict = {}
     if a.https:
         from backend.tls import ensure_cert, lan_addresses
