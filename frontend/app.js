@@ -506,8 +506,8 @@ class LiveCall {
     return new Promise(res => {
       const kind = m.kind, text = m.text;
       let started = false;
-      const start = () => { if (!started) { started = true; this.sendAgent("start", text, kind); } };
-      const end = () => { if (!started) start(); this.sendAgent("end", text, kind); res(); };
+      const start = () => { if (!started) { started = true; this.sendAgent("start", text, kind); $("#cap-agent").textContent = text; $(".cap.agent").classList.add("live"); } };
+      const end = () => { if (!started) start(); this.sendAgent("end", text, kind); $(".cap.agent").classList.remove("live"); res(); };
       if (m.audio_b64) {
         const a = new Audio("data:audio/mpeg;base64," + m.audio_b64);
         // the server only listens again after our 'end' event: guard it with a watchdog in case 'ended' never fires
@@ -550,7 +550,7 @@ class LiveCall {
     this.playing = true;
     while (this.queue.length && this.running) {
       const line = this.queue.shift();
-      this.log(line.text, `agent · ${line.kind}${line.brain === "gemini" ? " · gemini" : ""}${line.voice === "elevenlabs" ? " · elevenlabs" : ""}`);
+      this.log(line.text, `agent · ${line.kind}${line.brain === "gemini" ? " · gemini" : ""}${line.voice === "elevenlabs" ? " · elevenlabs" : ""}${line.level && line.level !== "normal" ? " · level " + line.level : ""}`);
       this.status("agent speaking…");
       await this.playLine(line);
       if (line.silence_after) { this.log(`(agent stays silent for ${line.silence_after} s)`, "silence", "note"); this.status("agent is silent…"); }
@@ -562,13 +562,25 @@ class LiveCall {
   onMessage(m) {
     if (m.type === "hello") { this.status(`call in progress · agent ${m.gemini ? "Gemini" : "scripted"} · voice ${m.elevenlabs ? "ElevenLabs" : "browser"} · noise floor ${fmt(m.floor_db, 0)} dBFS`); }
     else if (m.type === "agent_say") this.enqueue(m);
-    else if (m.type === "caller_said") this.log(m.text, "you", "you");
+    else if (m.type === "caller_said") { this.log(m.text, "you", "you"); $("#cap-you").textContent = m.text; $(".cap.you").classList.remove("live"); }
     else if (m.type === "status") { if (m.text) this.status(m.text); }
-    else if (m.type === "vad") { if (m.awaiting) this.status(m.speaking ? "hearing you…" : "listening…"); }
+    else if (m.type === "vad") this.onHear(m);
     else if (m.type === "agent_done") { this.status("agent finished the flow — press End call for the final verdict"); this.log("(the agent hung up)", "note", "note"); }
     else if (m.type === "update" && m.result) this.renderUpdate(m.result);
     else if (m.type === "final") this.renderFinal(m);
     else if (m.type === "error") this.status("server error: " + m.message);
+  }
+  // what the server hears: talking (level swinging like speech), background noise (raised but steady) or quiet
+  onHear(m) {
+    const h = $("#hearing");
+    const label = { talking: "talking", noise: "background noise", quiet: "quiet" }[m.state] || m.state;
+    h.textContent = `hearing: ${label}` + (m.state !== "quiet" ? ` · ${fmt(m.level_db, 0)} dBFS, swing ${fmt(m.mod_db, 1)} dB` : "") +
+      ` · floor ${fmt(m.floor_db, 0)} dBFS` + (m.state === "talking" && m.voiced ? " · voiced" : "") + (m.speaking ? " · turn open" : "");
+    h.className = "hearing " + m.state;
+    if (m.awaiting) {
+      this.status(m.state === "talking" ? "hearing you…" : (m.state === "noise" ? "background noise (not taken as speech)…" : "listening…"));
+      if (m.state === "talking") { $("#cap-you").textContent = "…"; $(".cap.you").classList.add("live"); }
+    }
   }
   renderUpdate(r) {
     this.history.push(r.p_synthetic);
@@ -576,6 +588,9 @@ class LiveCall {
     v.textContent = unsure ? "…" : r.verdict; v.className = "verdict-big " + (unsure ? "unsure" : r.verdict.toLowerCase());
     $("#live-conf").innerHTML = `<b>${pct(r.confidence)}</b> confidence <span class="p">· p(synthetic) = ${fmt(r.p_synthetic, 2)}</span>`;
     $("#live-meta").textContent = `${fmt(r.speech_seconds, 1)} s of caller speech · evidence ${pct(r.evidence_level)}`;
+    const L = r.live || {};
+    $("#live-avg").textContent = (L.p_avg === null || L.p_avg === undefined) ? "call average: waiting for evidence"
+      : `call average ${pct(L.p_avg)} synthetic over ${L.p_updates} readings · agent level ${L.level}${L.escalated ? " · challenge step added" : ""}`;
     const fill = $("#live-pfill");
     fill.style.width = (r.p_synthetic * 100) + "%";
     fill.style.background = unsure ? "var(--warn)" : (r.is_synthetic ? "var(--synthetic)" : "var(--human)");
@@ -622,7 +637,9 @@ function resetLivePanel() {
   $("#live-conf").textContent = "waiting for speech…"; $("#live-meta").textContent = "";
   $("#live-pfill").style.width = "0%"; $(".live-verdict .pmark").style.left = "50%";
   setLabels($("#live-lab-human"), $("#live-lab-synthetic"), null, true);
-  $("#live-cues").innerHTML = ""; $("#live-aspects").innerHTML = "";
+  $("#live-cues").innerHTML = ""; $("#live-aspects").innerHTML = ""; $("#live-avg").textContent = "";
+  $("#cap-agent").textContent = "—"; $("#cap-you").textContent = "—"; $$(".cap").forEach(c => c.classList.remove("live"));
+  $("#hearing").textContent = "hearing: —"; $("#hearing").className = "hearing";
 }
 
 const live = new LiveCall();

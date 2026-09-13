@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .audio import b64_to_bytes, call_from_arrays, load_call, looks_like_wav, to_wav_bytes
 from .config import settings
-from .live_agent import STEPS, ElevenLabsVoice, GeminiBrain, elevenlabs_available, gemini_available
+from .live_agent import STEPS, ElevenLabsVoice, GeminiBrain, elevenlabs_available, gemini_available, level_for
 from .scoring.pipeline import Analyzer
 
 logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO),
@@ -294,17 +294,40 @@ async def samples(limit: int = 400):
 
 # ----------------------------------------------------------------------------- live call (WebSocket)
 
+_HANN800 = np.hanning(800).astype(np.float32)
+
+
+def block_features(blk: np.ndarray) -> tuple[float, float]:
+    """Level (dBFS) and spectral flatness in the 300-3400 Hz band of one 100 ms block."""
+    db = 20 * np.log10(float(np.sqrt(np.mean(blk ** 2))) + 1e-6)
+    if len(blk) != 800:
+        return db, 1.0
+    p = np.abs(np.fft.rfft(blk * _HANN800)) ** 2
+    band = p[30:341]                                     # 10 Hz bins: 300 .. 3400 Hz
+    flat = float(np.exp(np.mean(np.log(band + 1e-12))) / (np.mean(band) + 1e-12))
+    return db, flat
+
+
 class LiveSession:
     """One live call: caller PCM (int16 mono 8 kHz) from the browser, agent lines from Gemini/ElevenLabs.
 
     The browser only captures the microphone and plays the agent's audio; the conversation state machine,
     the caller's end-of-utterance detection and the speech recognition all live here.
 
-    Caller speech is detected on 100 ms blocks against a noise floor that is the 10th percentile of the
-    last 15 s of block levels (seeded from the microphone check). A fixed floor cannot work: a laptop in a
-    noisy room easily sits at -40 dBFS, which a -60 dBFS assumption reads as continuous speech, so no
-    utterance ever ends and the agent never answers. Utterances are also capped in length, and every
-    caller/agent action runs under one lock so an answer is queued instead of dropped."""
+    Hearing the caller. Every 100 ms block gets a level; the noise floor is the 10th percentile of the last
+    15 s (seeded from the microphone check). A block that is `LIVE_SPEECH_RISE_DB` above the floor is not
+    yet speech: background noise sits at a nearly constant level while talking swings from syllable to
+    syllable, so the block is "talking" only if the level swing among the raised blocks of the last 0.8 s
+    (p90 - p10) exceeds `LIVE_TALK_MOD_DB` (3 dB) and it sits within `LIVE_PEAK_MARGIN_DB` of the caller's
+    own recent speech peaks; otherwise it is "noise". A turn opens on a talking block and only counts once it
+    holds four of them (a level step whose onset mimics a syllable is discarded silently), so a fan, a
+    passing car, quieter background voices or an AGC step cannot start a turn or keep it from ending; a
+    steady raise that lasts 2 s becomes the new floor. Turns are capped in length and every caller/agent
+    action runs under one lock, so an answer is queued instead of dropped.
+
+    The agent's brain receives the detector's running score (call average, latest reading, strongest cues)
+    with every line, and once the call average passes `LIVE_ESCALATE_P` the optional challenge step is
+    inserted and the questions get harder."""
 
     def __init__(self, ws: WebSocket, analyzer: Analyzer):
         self.ws, self.an = ws, analyzer
@@ -326,14 +349,27 @@ class LiveSession:
         self.timer: asyncio.Task | None = None
         self.pipeline: asyncio.Task | None = None
         self.lock = asyncio.Lock()
-        # caller utterance detection (100 ms blocks)
-        self.levels: deque = deque(maxlen=150)
+        # detector readings over the call
+        self.p_hist: list = []
+        self.p_avg: float | None = None
+        self.last_result: dict | None = None
+        # caller hearing (100 ms blocks)
+        self.levels: deque = deque(maxlen=150)      # 15 s of block levels -> noise floor
+        self.blk: deque = deque(maxlen=8)           # 0.8 s of (level, raised) -> level swing of raised blocks
+        self.talk_levels: deque = deque(maxlen=100) # levels of confirmed talking blocks -> caller's own peaks
+        self.talk_peak: float | None = None
         self.floor_db = -60.0
         self.seeded = False
+        self.level_db, self.mod_db, self.flat = -100.0, 0.0, 1.0
+        self.hear = "quiet"                          # quiet | noise | talking
+        self.hear_sent, self.hear_sent_t = "", -10.0
+        self.noise_run = 0
         self.speaking = False
-        self.vad_sent = False
         self.utt_start: float | None = None
         self.last_speech: float | None = None
+        self.utt_blocks = 0
+        self.utt_voiced = 0
+        self.utt_talk = 0
         self.caller_turns: list = []
         self.utterances = 0
 
@@ -360,33 +396,94 @@ class LiveSession:
         x = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
         self.chunks.append(x)
         finished = []
-        rise = settings.live_speech_rise_db
+        rise, talk_mod, margin = settings.live_speech_rise_db, settings.live_talk_mod_db, settings.live_peak_margin_db
         for i in range(0, len(x), 800):
             blk = x[i:i + 800]
             if len(blk) < 400:
                 break
             t = (self.n + i) / 8000.0
-            db = 20 * np.log10(float(np.sqrt(np.mean(blk ** 2))) + 1e-6)
+            db, flat = block_features(blk)
+            self.level_db, self.flat = db, flat
             self.levels.append(db)
             if len(self.levels) < 10:          # first second: only learn the room
-                self.floor_db = min(self.floor_db, db) if not self.seeded else self.floor_db
+                if not self.seeded:
+                    self.floor_db = min(self.floor_db, db)
                 continue
             self.floor_db = float(np.percentile(self.levels, 10))
-            thr_on = max(self.floor_db + rise, -62.0)
-            thr_off = max(self.floor_db + rise * 0.5, -66.0)
-            if not self.speaking:
-                if db > thr_on:
-                    self.speaking, self.utt_start, self.last_speech = True, t, t
+            raised = db > max(self.floor_db + rise, -62.0)
+            self.blk.append((db, raised))
+            # swing of the raised blocks in the window: speech moves syllable to syllable, a level step does not
+            up = [d for d, r in self.blk if r]
+            pool = up if len(up) >= 4 else [d for d, _ in self.blk]
+            self.mod_db = float(np.percentile(pool, 90) - np.percentile(pool, 10)) if len(pool) >= 4 else 0.0
+            near_peak = self.talk_peak is None or db >= self.talk_peak - margin
+            if raised and self.mod_db >= talk_mod and near_peak:
+                state = "talking"
+            elif raised:
+                state = "noise"                # louder than the floor but steady: not a person talking
             else:
-                if db > thr_off:
+                state = "quiet"
+            # a steady raise that lasts 2 s (fan, traffic, gain change) is the new floor, not a caller
+            self.noise_run = self.noise_run + 1 if state == "noise" else 0
+            if self.noise_run >= 20:
+                recent = float(np.percentile(list(self.levels)[-20:], 10))
+                self.levels.clear()
+                self.levels.extend([recent] * 20)
+                self.floor_db = recent
+                self.noise_run = 0
+            self.hear = state
+            if state == "talking":
+                self.talk_levels.append(db)
+                if len(self.talk_levels) >= 10:
+                    self.talk_peak = float(np.percentile(self.talk_levels, 90))
+            if not self.speaking:
+                if state == "talking":
+                    self.speaking, self.utt_start, self.last_speech = True, t, t
+                    self.utt_blocks, self.utt_voiced, self.utt_talk = 0, 0, 1
+            else:
+                self.utt_blocks += 1
+                if raised and flat < 0.35:
+                    self.utt_voiced += 1
+                if state == "talking":
+                    self.utt_talk += 1
                     self.last_speech = t
+                elif raised and near_peak and self.utt_talk >= 4:
+                    self.last_speech = t       # confirmed speech: a held vowel keeps the turn alive
                 too_long = t - self.utt_start >= settings.live_max_utterance_s
                 if t - self.last_speech >= settings.live_end_silence_s or too_long:
                     self.speaking = False
-                    if self.last_speech - self.utt_start >= settings.live_min_utterance_s:
+                    if self.utt_talk >= 4 and self.last_speech - self.utt_start >= settings.live_min_utterance_s:
                         finished.append((self.utt_start, min(self.last_speech + 0.15, t)))
+                    # otherwise: a level step without the swing of speech -> discarded, nothing is sent
         self.n += len(x)
         return finished
+
+    # ---------------------------------------------------------------- detector readings
+    def note_result(self, res: dict) -> None:
+        """Keep the rolling verdicts; the call average (not the latest reading) drives the agent's level."""
+        self.last_result = res
+        if float(res.get("evidence_level", 0.0) or 0.0) >= 0.25:
+            self.p_hist.append(float(res["p_synthetic"]))
+            self.p_avg = float(np.mean(self.p_hist))
+
+    def escalated(self) -> bool:
+        return self.p_avg is not None and self.p_avg >= settings.live_escalate_p
+
+    def detector_context(self) -> dict | None:
+        r = self.last_result
+        if not r or self.p_avg is None:
+            return None
+        asp = [a for a in (r.get("aspects") or {}).values() if a.get("score") is not None]
+        asp.sort(key=lambda a: -abs(a["score"] - 0.5) * float(a.get("weight", 1.0)))
+        return {"p_avg": self.p_avg, "p_latest": float(r["p_synthetic"]), "confidence": float(r["confidence"]),
+                "evidence": float(r.get("evidence_level", 0.0)), "n": len(self.p_hist),
+                "cues": [{"label": a["label"], "score": int(round(a["score"] * 100))} for a in asp[:3]]}
+
+    def advance(self) -> None:
+        """Move to the next step; optional steps only run once the call is escalated."""
+        self.step += 1
+        while self.step < len(STEPS) and STEPS[self.step].get("optional") == "escalated" and not self.escalated():
+            self.step += 1
 
     # ---------------------------------------------------------------- agent timeline helpers
     def agent_segments(self) -> list:
@@ -431,12 +528,17 @@ class LiveSession:
     async def status(self, text: str) -> None:
         await self.send({"type": "status", "text": text})
 
-    async def vad_feedback(self) -> None:
-        """Tell the browser when the server starts / stops hearing the caller (debuggable turn taking)."""
-        if self.speaking != self.vad_sent:
-            self.vad_sent = self.speaking
-            await self.send({"type": "vad", "speaking": self.speaking, "floor_db": round(self.floor_db, 1),
-                             "awaiting": self.await_answer, "t": round(self.seconds(), 2)})
+    async def hear_feedback(self) -> None:
+        """Tell the browser what the server hears: talking, background noise or quiet (and the numbers)."""
+        now = self.seconds()
+        changed = self.hear != self.hear_sent
+        due = now - self.hear_sent_t >= (1.0 if self.hear != "quiet" else 3.0)
+        if changed or due:
+            self.hear_sent, self.hear_sent_t = self.hear, now
+            await self.send({"type": "vad", "state": self.hear, "speaking": bool(self.speaking and self.utt_talk >= 4),
+                             "awaiting": self.await_answer, "peak_db": None if self.talk_peak is None else round(self.talk_peak, 1),
+                             "level_db": round(self.level_db, 1), "floor_db": round(self.floor_db, 1),
+                             "mod_db": round(self.mod_db, 1), "voiced": bool(self.flat < 0.35), "t": round(now, 2)})
 
     async def exclusive(self, coro) -> None:
         """Run one caller/agent action at a time; later actions wait instead of being dropped."""
@@ -455,7 +557,8 @@ class LiveSession:
         return {"type": "agent_say", "step": self.step + 1, "steps": len(STEPS), "kind": kind, "text": text,
                 "audio_b64": base64.b64encode(audio).decode("ascii") if audio else None,
                 "silence_after": step.get("silence_after", 0), "end": bool(step.get("end")),
-                "brain": brain, "voice": "elevenlabs" if audio else "browser"}
+                "brain": brain, "voice": "elevenlabs" if audio else "browser",
+                "level": level_for(self.p_avg), "p_avg": None if self.p_avg is None else round(self.p_avg, 3)}
 
     async def speak_step(self, caller_text: str) -> None:
         """Generate (Gemini) + synthesize (ElevenLabs) the current step's line and hand it to the browser."""
@@ -467,7 +570,7 @@ class LiveSession:
         step = STEPS[self.step]
         try:
             await self.status("thinking…")
-            text = await run_in_threadpool(self.brain.line, self.step, caller_text)
+            text = await run_in_threadpool(self.brain.line, self.step, caller_text, self.detector_context())
             await self.status("synthesizing…")
             audio = await run_in_threadpool(self.voice.synthesize, text)
             await self.send(self._say_payload(text, audio, step["kind"], step,
@@ -499,7 +602,7 @@ class LiveSession:
         elif step.get("silence_after") and ev.get("kind") != "repeat":
             async def later():
                 await asyncio.sleep(step["silence_after"])
-                self.step += 1
+                self.advance()
                 await self.exclusive(self.speak_step(""))
             self.cancel_timer()
             self.timer = asyncio.create_task(later())
@@ -518,12 +621,14 @@ class LiveSession:
         if self.await_answer and not self.busy and not self.done:
             log.info("live: no answer within %.0fs, agent moves on", settings.live_answer_timeout_s)
             await self.send({"type": "caller_said", "text": "(no se escuchó respuesta)", "t": round(self.seconds(), 2)})
-            self.step += 1
+            self.advance()
             await self.exclusive(self.speak_step(""))
 
     async def on_utterance(self, s: float, e: float) -> None:
         self.utterances += 1
-        log.info("live: caller utterance %.1f-%.1f s (floor %.0f dBFS, awaiting=%s)", s, e, self.floor_db, self.await_answer)
+        voiced = self.utt_voiced / max(self.utt_blocks, 1)
+        log.info("live: caller utterance %.1f-%.1f s (floor %.0f dBFS, voiced %.0f%%, awaiting=%s)", s, e, self.floor_db,
+                 voiced * 100, self.await_answer)
         if not self.await_answer or self.busy or self.done:
             return
         x = self.audio()[int(s * 8000):int(e * 8000)]
@@ -552,7 +657,7 @@ class LiveSession:
             return
         self.caller_turns.append({"start": round(s, 2), "end": round(e, 2), "text": text})
         await self.send({"type": "caller_said", "text": text, "t": round(s, 2)})
-        self.step += 1
+        self.advance()
         await self.speak_step(text)
 
     def interrupt_due(self) -> bool:
@@ -579,9 +684,13 @@ class LiveSession:
         call = call_from_arrays(x, None)
         segs = self.agent_segments()
         res = await run_in_threadpool(self.an.analyze, call, segs, self.agent_text_turns(), final, final, False)
+        if not final:
+            self.note_result(res)
         res["live"] = {"seconds": round(self.seconds(), 1), "agent_turns": len(segs), "step": self.step,
                        "caller_turns": self.caller_turns if final else len(self.caller_turns),
-                       "utterances": self.utterances, "floor_db": round(self.floor_db, 1),
+                       "utterances": self.utterances, "floor_db": round(self.floor_db, 1), "hear": self.hear,
+                       "p_avg": None if self.p_avg is None else round(self.p_avg, 3), "p_updates": len(self.p_hist),
+                       "escalated": self.escalated(), "level": level_for(self.p_avg),
                        "brain": "gemini" if self.brain.enabled else "canned", "voice": "elevenlabs" if self.voice.enabled else "browser"}
         return res
 
@@ -616,7 +725,7 @@ async def ws_live(ws: WebSocket):
                     spawn(sess.on_utterance(s, e))
                 if sess.speaking and sess.interrupt_due():
                     spawn(sess.do_interrupt())
-                await sess.vad_feedback()
+                await sess.hear_feedback()
                 if sess.n - sess.last_analyzed >= interval * 8000 and (inflight["task"] is None or inflight["task"].done()):
                     sess.last_analyzed = sess.n
                     inflight["task"] = asyncio.create_task(update_task())
@@ -629,7 +738,8 @@ async def ws_live(ws: WebSocket):
                 if t == "start":
                     sess.seed_floor(m.get("floor_dbfs"))
                     await sess.send({"type": "hello", "gemini": sess.brain.enabled, "elevenlabs": sess.voice.enabled,
-                                     "steps": [s["kind"] for s in STEPS], "floor_db": round(sess.floor_db, 1)})
+                                     "steps": [s["kind"] for s in STEPS], "floor_db": round(sess.floor_db, 1),
+                                     "escalate_p": settings.live_escalate_p})
                     spawn(sess.speak_step(""))
                 elif t == "agent":
                     await sess.on_agent_event({"event": m.get("event"), "t": float(m.get("t", sess.seconds())),

@@ -177,6 +177,19 @@ table.contrib td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .mini-aspects .n { font-size: 10px; letter-spacing: .05em; text-transform: uppercase; }
 canvas#live-spark { border: 1px solid var(--line2); background: var(--ink); width: 100%; max-width: 340px; margin-top: 10px; }
 
+/* live captions + what the server hears */
+.captions { margin-top: 12px; display: grid; gap: 4px; }
+.cap { padding: 6px 10px; background: var(--panel2); border-left: 4px solid var(--line2); font-size: 14px; min-height: 30px; }
+.cap.agent { border-left-color: var(--agent); }
+.cap.you { border-left-color: var(--caller); }
+.cap.live { background: rgba(107, 143, 214, .16); border-left-width: 6px; }
+.cap.you.live { background: rgba(214, 154, 92, .16); }
+.cap .kind { font-family: var(--font-mono); color: var(--muted); font-size: var(--mono-s); text-transform: uppercase; margin-right: 10px; }
+.hearing { margin-top: 6px; font-family: var(--font-mono); font-size: var(--mono); color: var(--muted); text-transform: uppercase; }
+.hearing.talking { color: var(--caller); }
+.hearing.noise { color: var(--warn); }
+.hearing.quiet { color: var(--muted); }
+
 /* microphone check */
 .mic-report { margin-top: 12px; border: 2px solid var(--line2); padding: 10px 12px; background: var(--panel2); }
 .mic-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }

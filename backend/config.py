@@ -98,6 +98,11 @@ class Settings:
     live_answer_timeout_s: float = _f("LIVE_ANSWER_TIMEOUT_S", 9.0)   # agent moves on if the caller says nothing
     live_max_utterance_s: float = _f("LIVE_MAX_UTTERANCE_S", 20.0)    # a caller turn is cut here (monologue or noise)
     live_speech_rise_db: float = _f("LIVE_SPEECH_RISE_DB", 8.0)       # speech = this far above the tracked noise floor
+    live_talk_mod_db: float = _f("LIVE_TALK_MOD_DB", 3.0)            # talking swings > this over 0.8 s; steady = background noise
+    live_peak_margin_db: float = _f("LIVE_PEAK_MARGIN_DB", 12.0)      # blocks quieter than the caller's own peaks by more are background
+    live_peak_margin_db: float = _f("LIVE_PEAK_MARGIN_DB", 12.0)      # blocks quieter than the caller's own peaks by more are background
+    live_peak_margin_db: float = _f("LIVE_PEAK_MARGIN_DB", 12.0)      # blocks quieter than the caller's own peaks by more are background
+    live_escalate_p: float = _f("LIVE_ESCALATE_P", 0.70)             # call-average p(synthetic) that escalates the agent's questions
 
     # --- misc ---
     log_level: str = _s("LOG_LEVEL", "INFO")

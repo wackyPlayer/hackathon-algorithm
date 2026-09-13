@@ -214,12 +214,25 @@ and the fallback adds ~2 s per request that has nothing to do with the detector.
   timeout (9 s) run server-side on the 8 kHz stream; the browser only captures the microphone and plays the
   agent's audio, reporting when it starts and stops so the turn timeline is exact. The verdict, aspects and
   events update every 2 s; "End call" returns the full report, the transcript and the recorded WAV.
-  The caller's speech is detected against a noise floor tracked as the 10th percentile of the last 15 s of
-  100 ms block levels (seeded from the microphone check), never against a fixed level: a −40 dBFS room used to
-  read as continuous speech, so no turn ever ended and the agent never answered. Turns are capped at 20 s,
+  **Hearing the caller.** The noise floor is the 10th percentile of the last 15 s of 100 ms block levels
+  (seeded from the microphone check), never a fixed level: a −40 dBFS room used to read as continuous speech,
+  so no turn ever ended and the agent never answered. A block above the floor is *talking* only if the level
+  swings the way speech does (p90 − p10 over the last 0.8 s above 3 dB, `LIVE_TALK_MOD_DB`); a raised but
+  steady level is *background noise* (a fan, traffic, a gain step): it cannot open a turn or keep one from
+  ending, and after 2 s it becomes the new floor. The "hearing:" line under the captions shows which of the
+  three the server currently takes the input for, with level, swing and floor. Turns are capped at 20 s,
   caller and agent actions run under one lock (an answer is queued, never dropped), the browser guards the
   agent's end-of-audio events with watchdogs, and speech the transcriber cannot read gets a "¿me lo puede
-  repetir?" instead of silence. The status line shows "hearing you…" while the server detects your voice.
+  repetir?" instead of silence. Captions show the agent's current line and your last transcription.
+  **A distrustful agent.** Marina's prompt tells her to distrust the caller (a possible ASR → LLM → TTS bot),
+  never to confirm products or data the caller claims, and gives her tactics that trip up a language model
+  (false premise, reversed folio, immediate-environment detail, short-answer instructions, sequence tasks,
+  abrupt topic changes). Every turn she receives the detector's reading: the **call average** of the rolling
+  synthetic score (not the latest reading), the latest reading, evidence and the strongest cues, never
+  revealed to the caller. Up to 50 % she follows the script; 50–70 % adds a light check; above 70 %
+  (`LIVE_ESCALATE_P`) an extra challenge step is inserted and the remaining questions are asked at the
+  "alto" level (harder, more concrete, re-asked when the answer is generic). The live panel shows the call
+  average and the agent's level.
 * **Microphone check** — *Test microphone* (and, automatically, the first *Start call*) records 2 s of silence
   and a spoken sentence, sends it to `POST /miccheck` and grades the input **good / fair / poor** with plain
   warnings and the risk they carry: digital silence or a perfectly constant floor from a noise gate, browser
