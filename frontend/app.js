@@ -134,6 +134,36 @@ function scoreColor(s) {
   return s === null || s === undefined ? "#3b3630" : (s < 0.4 ? "var(--human)" : (s > 0.6 ? "var(--synthetic)" : "var(--warn)"));
 }
 
+// The few indicators that matter most for this verdict: strongest deviation from neutral, weighted.
+function topCues(aspects, n = 3) {
+  return Object.entries(aspects || {})
+    .filter(([, a]) => a.score !== null && a.score !== undefined && a.n_terms > 0)
+    .map(([k, a]) => ({ key: k, label: a.label, score: a.score, strength: Math.abs(a.score - 0.5) * (a.weight || 1) }))
+    .sort((a, b) => b.strength - a.strength)
+    .slice(0, n);
+}
+
+function cueHtml(c) {
+  const read = c.score > 0.6 ? "synthetic-like" : (c.score < 0.4 ? "human-like" : "neutral");
+  return `<div class="cue" title="${esc(read)}"><div class="cue-head"><span class="cue-name">${esc(c.label)}</span><span class="cue-score">${Math.round(c.score * 100)}</span></div><div class="bar"><i style="width:${c.score * 100}%;background:${scoreColor(c.score)}"></i></div></div>`;
+}
+
+// Human / Synthetic labels under the bar: both glow until a verdict exists, then the loser turns gray.
+function setLabels(human, synthetic, res, unsure) {
+  for (const el of [human, synthetic]) el.classList.remove("selected", "dim");
+  if (unsure || !res) return;
+  const win = res.is_synthetic ? synthetic : human, lose = res.is_synthetic ? human : synthetic;
+  win.classList.add("selected"); lose.classList.add("dim");
+}
+
+function metaLine(res, title) {
+  const parts = [];
+  if (title) parts.push(title);
+  parts.push(`${fmt(res.duration_seconds, 1)} s of audio`, `${fmt(res.speech_seconds, 1)} s of caller speech`, `evidence ${pct(res.evidence_level)}`, res.mode.replace("_", " "), `${fmt(res.timing && res.timing.total_s)} s`);
+  if (res.input && !res.input.has_agent_channel) parts.push("no agent channel: turn-taking signals unavailable");
+  return parts.join(" · ");
+}
+
 function renderResult(res, root, title) {
   const tpl = $("#tpl-result").content.cloneNode(true);
   const f = (k) => tpl.querySelector(`[data-f="${k}"]`);
@@ -144,21 +174,24 @@ function renderResult(res, root, title) {
   v.className = "verdict-big " + (unsure ? "unsure" : res.verdict.toLowerCase());
   f("confidence").textContent = pct(res.confidence);
   f("p").textContent = fmt(p, 3);
-  f("meta").textContent = `${title ? title + " · " : ""}${fmt(res.duration_seconds, 1)} s of audio, ${fmt(res.speech_seconds, 1)} s of caller speech · evidence ${pct(res.evidence_level)} · ${res.mode} · ${fmt(res.timing.total_s)} s` +
-    (res.input && !res.input.has_agent_channel ? " · no agent channel (turn-taking signals unavailable)" : "");
+  f("meta").textContent = metaLine(res, title);
   // flat rectangular probability bar: fill = p(synthetic), colour by verdict
   const fill = f("pfill");
   fill.style.width = (p * 100) + "%";
   fill.style.background = unsure ? "var(--warn)" : (res.is_synthetic ? "var(--synthetic)" : "var(--human)");
   tpl.querySelector(".pmark").style.left = (p * 100) + "%";
+  setLabels(f("lab-human"), f("lab-synthetic"), res, unsure);
 
-  // aspects
+  // top cues (always visible) + all indicators (expandable)
+  const cues = topCues(res.aspects);
+  f("cues").innerHTML = (cues.length ? `<span class="cues-label meta">strongest cues</span>` : "") + cues.map(cueHtml).join("");
   const asp = f("aspects");
+  const topKeys = new Set(cues.map(c => c.key));
   for (const [k, a] of Object.entries(res.aspects)) {
     const d = document.createElement("div");
     const s = a.score;
-    d.className = "aspect";
-    d.innerHTML = `<div class="aspect-head"><span class="aspect-name">${esc(a.label)}</span><span class="muted small">${a.n_terms} cues</span><span class="aspect-score">${s === null ? "n/a" : Math.round(s * 100)}</span></div>
+    d.className = "aspect" + (topKeys.has(k) ? " open" : "");
+    d.innerHTML = `<div class="aspect-head"><span class="aspect-name">${esc(a.label)}</span><span class="aspect-cues">${a.n_terms} cues</span><span class="aspect-score">${s === null ? "n/a" : Math.round(s * 100)}</span></div>
       <div class="bar"><i style="width:${s === null ? 0 : s * 100}%;background:${scoreColor(s)}"></i></div>
       <div class="aspect-ev">${(a.evidence || []).map(e => `<div><span>${esc(e.desc)} <code>${esc(e.feature)}</code></span><span>${fmt(e.value, 3)} <b class="read-${e.read}">${e.read}</b></span></div>`).join("") || "<div>no cues available for this clip</div>"}</div>`;
     d.addEventListener("click", () => d.classList.toggle("open"));
@@ -169,13 +202,15 @@ function renderResult(res, root, title) {
   const attacks = Object.entries(res.attack_profile).sort((a, b) => b[1].p - a[1].p);
   for (const [k, a] of attacks) {
     const d = document.createElement("div"); d.className = "attack";
-    d.innerHTML = `<div class="row2"><span>${esc(a.label)}</span><span><b>${pct(a.p)}</b> <span class="muted small">(cue strength ${Math.round(a.raw * 100)})</span></span></div><div class="bar"><i style="width:${a.p * 100}%;background:var(--synthetic)"></i></div>`;
+    d.innerHTML = `<div class="row2"><span>${esc(a.label)}</span><span class="mono"><b>${pct(a.p)}</b> <span class="muted">cue strength ${Math.round(a.raw * 100)}</span></span></div><div class="bar"><i style="width:${a.p * 100}%;background:var(--synthetic)"></i></div>`;
     at.appendChild(d);
   }
   // signals
   const sg = f("signals");
   const S = res.signals;
-  const rows = [["fast model (features)", S.fast_model_p], ["heuristic aspects", S.heuristic_p], ["SSL embedding head", S.embedding_p], ["semantic judge", S.semantic_p], ["fused", S.fused_p], ["final (evidence-weighted)", res.p_synthetic]];
+  const rows = [["main model (all features)", S.main_model_p !== undefined ? S.main_model_p : S.fast_model_p], ["acoustic-only head (voice texture)", S.acoustic_p],
+    ["fast model (fused heads)", S.fast_model_p], ["heuristic aspects", S.heuristic_p], ["SSL embedding head", S.embedding_p], ["semantic judge", S.semantic_p],
+    ["fused", S.fused_p], ["final (evidence-weighted)", res.p_synthetic]];
   sg.innerHTML = rows.map(([k, v]) => `<span class="k">${k}</span><span>${v === null || v === undefined ? "not run" : fmt(v, 3)}</span>`).join("");
 
   // spectrogram + events
@@ -190,7 +225,7 @@ function renderResult(res, root, title) {
     f("contrib").innerHTML = `<div class="groups">${g.map(([k, v]) => `<span class="${v > 0 ? "pos" : "neg"}">${esc(k)} ${v > 0 ? "+" : ""}${fmt(v, 2)}</span>`).join("")}</div>
       <table class="contrib"><thead><tr><th>feature</th><th class="num">value</th><th class="num">contribution</th></tr></thead><tbody>
       ${c.top_features.map(t => `<tr><td><code>${esc(t.feature)}</code></td><td class="num">${fmt(t.value, 3)}</td><td class="num ${t.contribution > 0 ? "pos" : "neg"}">${t.contribution > 0 ? "+" : ""}${fmt(t.contribution, 2)}</td></tr>`).join("")}
-      </tbody></table><div class="muted small">positive pushes toward synthetic, negative toward human (intercept ${fmt(c.intercept, 2)})</div>`;
+      </tbody></table><div class="meta">positive pushes toward synthetic, negative toward human (intercept ${fmt(c.intercept, 2)})</div>`;
   } else {
     f("contrib-card").classList.add("hidden");
   }
@@ -203,14 +238,14 @@ function renderResult(res, root, title) {
     const tr = (s.available && s.transcript) ? s.transcript : (liveTurns ? { agent: [], caller: liveTurns } : null);
     if (tr) {
       const turns = [...tr.agent.map(t => ({ ...t, who: "agent" })), ...tr.caller.map(t => ({ ...t, who: "caller" }))].sort((a, b) => a.start - b.start);
-      html += `<div class="transcript">${turns.map(t => `<div class="t ${t.who}"><span class="muted small">${fmt(t.start, 1)}s ${t.who.toUpperCase()}</span> ${esc(t.text)}</div>`).join("")}</div>`;
-      if (s.stt_seconds) html += `<div class="muted small">transcription ${fmt(s.stt_seconds, 1)} s${s.llm_seconds ? ", judge " + fmt(s.llm_seconds, 1) + " s" : ""}</div>`;
+      html += `<div class="transcript">${turns.map(t => `<div class="t ${t.who}"><span class="meta">${fmt(t.start, 1)}s ${t.who}</span> ${esc(t.text)}</div>`).join("")}</div>`;
+      if (s.stt_seconds) html += `<div class="meta">transcription ${fmt(s.stt_seconds, 1)} s${s.llm_seconds ? ", judge " + fmt(s.llm_seconds, 1) + " s" : ""}</div>`;
     }
     if (s.judge) {
       const j = s.judge;
       html += `<h2 class="mt">Judge</h2><p><b>synthetic ${pct(j.synthetic_probability)}</b> · fabrication ${pct(j.fabrication_probability)} · LLM style ${pct(j.llm_style_probability)} · repeat-back: ${esc(j.repeat_back)}</p><p>${esc(j.rationale)}</p>`;
       if (j.nonexistent_probes && j.nonexistent_probes.length) html += `<ul>${j.nonexistent_probes.map(q => `<li><i>${esc(q.agent_question)}</i> → <b>${esc(q.caller_reaction)}</b></li>`).join("")}</ul>`;
-      if (j.human_markers && j.human_markers.length) html += `<div class="muted small">human markers: ${esc(j.human_markers.join("; "))}</div>`;
+      if (j.human_markers && j.human_markers.length) html += `<div class="meta">human markers: ${esc(j.human_markers.join("; "))}</div>`;
     } else if (s.judge_error) {
       html += `<div class="muted">judge not run: ${esc(s.judge_error)}</div>`;
     } else if (s.error) {
@@ -266,22 +301,22 @@ function drawSpectrogram(canvas, res) {
     }
     ctx.fillStyle = "rgba(148,163,184,.55)";
     for (const [s, e] of (ui.breaths || [])) ctx.fillRect(X(s), specH - 12, Math.max(2, X(e) - X(s)), 12);
-    ctx.fillStyle = "#a39a89"; ctx.font = "11px 'Monster Friend', monospace";
-    ctx.fillText("4 kHz", 4, 12); ctx.fillText("0", 4, specH - 4);
+    ctx.fillStyle = "#a39a89"; ctx.font = "13px 'Monobit', monospace";
+    ctx.fillText("4 KHZ", 4, 13); ctx.fillText("0", 4, specH - 4);
   }
   ctx.fillStyle = "#24211e"; ctx.fillRect(0, laneY, W, laneH); ctx.fillRect(0, laneY + laneH + 2, W, laneH);
   ctx.fillStyle = "#6b8fd6"; for (const [s, e] of (tl.agent || [])) ctx.fillRect(X(s), laneY + 2, Math.max(1, X(e) - X(s)), laneH - 4);
   ctx.fillStyle = "#d69a5c"; for (const [s, e] of (tl.caller_phrases || tl.caller || [])) ctx.fillRect(X(s), laneY + laneH + 4, Math.max(1, X(e) - X(s)), laneH - 4);
-  ctx.fillStyle = "#a39a89"; ctx.font = "10px 'Monster Friend', monospace"; ctx.fillText("agent", 3, laneY + 12); ctx.fillText("caller", 3, laneY + laneH + 14);
+  ctx.fillStyle = "#a39a89"; ctx.font = "12px 'Monobit', monospace"; ctx.fillText("AGENT", 3, laneY + 13); ctx.fillText("CALLER", 3, laneY + laneH + 15);
   const colors = { response: "#a78bfa", agent_interrupt: "#e07aa8", silence_fill: "#e0b34a", backchannel: "#5fb98f", caller_interrupt: "#e07aa8", false_start: "#94a3b8" };
   for (const e of (res.events || [])) {
     const c = colors[e.type]; if (!c) continue;
     ctx.fillStyle = c; ctx.fillRect(X(e.t) - 1, evY, 3, 14);
-    if (e.type === "response") { ctx.fillStyle = "#a78bfa"; ctx.font = "10px 'Monster Friend', monospace"; ctx.fillText(fmt(e.latency, 1), X(e.t) + 3, evY + 11); }
+    if (e.type === "response") { ctx.fillStyle = "#a78bfa"; ctx.font = "12px 'Monobit', monospace"; ctx.fillText(fmt(e.latency, 1), X(e.t) + 3, evY + 12); }
   }
-  ctx.fillStyle = "#a39a89"; ctx.font = "10px 'Monster Friend', monospace";
+  ctx.fillStyle = "#a39a89"; ctx.font = "12px 'Monobit', monospace";
   const step = dur > 120 ? 30 : (dur > 40 ? 10 : 5);
-  for (let t = 0; t <= dur; t += step) { ctx.fillRect(X(t), H - 14, 1, 4); ctx.fillText(t + "s", X(t) + 2, H - 4); }
+  for (let t = 0; t <= dur; t += step) { ctx.fillRect(X(t), H - 14, 1, 4); ctx.fillText(t + "S", X(t) + 2, H - 3); }
 }
 
 // ------------------------------------------------------------------ live call (server-driven agent: Gemini + ElevenLabs)
@@ -311,6 +346,106 @@ class PcmCapture extends AudioWorkletProcessor {
 }
 registerProcessor("pcm-capture", PcmCapture);`;
 
+const MIC_CONSTRAINTS = { audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } };
+
+// Open the microphone and the 8 kHz PCM capture worklet. Returns {ctx, stream, node, settings}.
+async function openMic() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("microphone API unavailable: open the page over https:// or on localhost");
+  const stream = await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  const src = ctx.createMediaStreamSource(stream);
+  const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
+  await ctx.audioWorklet.addModule(url);
+  const node = new AudioWorkletNode(ctx, "pcm-capture");
+  src.connect(node);
+  const track = stream.getAudioTracks()[0];
+  const st = (track && track.getSettings) ? track.getSettings() : {};
+  const settings = { noiseSuppression: !!st.noiseSuppression, autoGainControl: !!st.autoGainControl, echoCancellation: !!st.echoCancellation,
+    sampleRate: st.sampleRate || ctx.sampleRate, device: (track && track.label) || "" };
+  return { ctx, stream, node, settings };
+}
+
+function closeMic(m) {
+  try { m.node && m.node.disconnect(); m.stream && m.stream.getTracks().forEach(t => t.stop()); m.ctx && m.ctx.close(); } catch (e) { /* ignore */ }
+}
+
+function meter(db, speaking) {
+  $("#mic-level").style.width = Math.max(0, Math.min(100, (db + 60) * 1.8)) + "%";
+  $("#mic-level").style.background = speaking ? "var(--caller)" : "var(--human)";
+}
+
+// ------------------------------------------------------------------ microphone check (before a call)
+const MIC = { last: null, at: 0, running: false };
+
+function renderMicReport(rep, extra) {
+  const box = $("#mic-report");
+  box.classList.remove("hidden");
+  if (!rep) { box.innerHTML = `<div class="mic-head"><span class="q testing">testing</span><span class="meta">${esc(extra || "")}</span></div>`; return; }
+  const m = rep.metrics || {};
+  const chips = [["speech", m.speech_seconds !== undefined ? fmt(m.speech_seconds, 1) + " s" : "—"], ["snr", m.snr_db === null || m.snr_db === undefined ? "—" : fmt(m.snr_db, 0) + " dB"],
+    ["floor", m.floor_dbfs === null || m.floor_dbfs === undefined ? "—" : fmt(m.floor_dbfs, 0) + " dBFS"], ["level", m.level_dbfs === null || m.level_dbfs === undefined ? "—" : fmt(m.level_dbfs, 0) + " dBFS"],
+    ["peak", m.peak_dbfs === null || m.peak_dbfs === undefined ? "—" : fmt(m.peak_dbfs, 1) + " dBFS"], ["digital silence", pct(m.digital_silence_frac)],
+    ["roll-off", m.rolloff_hz ? m.rolloff_hz + " Hz" : "—"], ["hum", m.hum_db === null || m.hum_db === undefined ? "—" : fmt(m.hum_db, 0) + " dB"]];
+  const c = rep.client || {};
+  const flags = [c.noise_suppression ? "noise suppression ON" : "noise suppression off", c.auto_gain ? "AGC ON" : "AGC off", c.echo_cancellation ? "echo cancel on" : "echo cancel off", c.sample_rate ? c.sample_rate + " Hz" : ""].filter(Boolean);
+  const riskName = { false_positive: "possible false positive", false_negative: "possible false negative", unreliable: "unreliable verdict" };
+  box.innerHTML = `<div class="mic-head"><span class="q ${esc(rep.quality)}">mic ${esc(rep.quality)}</span><span>${esc(rep.summary)}</span></div>
+    <div class="metrics">${chips.map(([k, v]) => `<span>${esc(k)} ${esc(v)}</span>`).join("")}${flags.map(f => `<span>${esc(f)}</span>`).join("")}${c.device ? `<span>${esc(c.device)}</span>` : ""}</div>
+    ${rep.warnings && rep.warnings.length ? `<ul class="warns">${rep.warnings.map(w => `<li class="${esc(w.level)}"><span class="risk">${esc(riskName[w.risk] || w.risk)}</span>${esc(w.text)}</li>`).join("")}</ul>` : ""}`;
+}
+
+async function micCheck(seconds = 5) {
+  if (MIC.running) return MIC.last;
+  MIC.running = true;
+  const btn = $("#mic-test"); btn.disabled = true;
+  let m = null;
+  try {
+    renderMicReport(null, "opening the microphone…");
+    m = await openMic();
+    const chunks = [];
+    let speaking = false, lastSpeech = 0, floor = -60, n = 0;
+    m.node.port.onmessage = ev => {
+      chunks.push(new Uint8Array(ev.data.pcm)); n += 800;
+      const db = 20 * Math.log10(ev.data.rms + 1e-6), now = n / 8000;
+      if (!speaking && db < floor + 6) floor = floor * 0.95 + db * 0.05;
+      if (db > Math.max(floor + 9, -50)) { speaking = true; lastSpeech = now; } else if (speaking && now - lastSpeech > 0.4) speaking = false;
+      meter(db, speaking);
+    };
+    const t0 = performance.now();
+    await new Promise(res => {
+      const tick = () => {
+        const el = (performance.now() - t0) / 1000;
+        if (el >= seconds) return res();
+        const msg = el < 2 ? `microphone check: stay quiet… ${Math.ceil(2 - el)}` : `microphone check: say a full sentence… ${Math.ceil(seconds - el)}`;
+        $("#live-status").textContent = msg; renderMicReport(null, msg);
+        setTimeout(tick, 200);
+      };
+      tick();
+    });
+    closeMic(m);
+    const blob = new Blob(chunks, { type: "application/octet-stream" });
+    const q = new URLSearchParams({ ns: m.settings.noiseSuppression ? 1 : 0, agc: m.settings.autoGainControl ? 1 : 0, ec: m.settings.echoCancellation ? 1 : 0,
+      sr: Math.round(m.settings.sampleRate || 0), device: m.settings.device.slice(0, 80) });
+    $("#live-status").textContent = "microphone check: analysing…";
+    const r = await fetch("/miccheck?" + q.toString(), { method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: blob });
+    if (!r.ok) throw new Error(await r.text());
+    const rep = await r.json();
+    MIC.last = rep; MIC.at = Date.now();
+    renderMicReport(rep);
+    $("#live-status").textContent = `microphone ${rep.quality}`;
+    return rep;
+  } catch (e) {
+    if (m) closeMic(m);
+    $("#mic-report").classList.remove("hidden");
+    $("#mic-report").innerHTML = `<div class="mic-head"><span class="q poor">mic check failed</span><span>${esc(e.message)}</span></div>`;
+    $("#live-status").textContent = "microphone check failed: " + e.message;
+    return null;
+  } finally {
+    MIC.running = false; btn.disabled = false;
+  }
+}
+
 class LiveCall {
   constructor() {
     this.ws = null; this.ctx = null; this.sent = 0; this.speaking = false; this.lastSpeech = 0; this.floor = -60;
@@ -324,16 +459,15 @@ class LiveCall {
   status(t) { $("#live-status").textContent = t; }
   async start() {
     $("#live-result").innerHTML = ""; $("#agent-log").innerHTML = ""; $("#live-events").innerHTML = ""; this.history = []; this.queue = []; this.playing = false; this.stopping = false;
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("microphone API unavailable: open the page over https:// or on localhost");
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false } });
-    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-    await this.ctx.resume();
-    const src = this.ctx.createMediaStreamSource(stream);
-    const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
-    await this.ctx.audioWorklet.addModule(url);
-    this.node = new AudioWorkletNode(this.ctx, "pcm-capture");
-    this.stream = stream;
-    src.connect(this.node);
+    $("#live-start").disabled = true;
+    // microphone quality check first (skipped if one was done in the last 10 minutes) so the user knows
+    // whether this input can bias the verdict
+    if (!MIC.last || Date.now() - MIC.at > 10 * 60 * 1000) {
+      const rep = await micCheck();
+      if (rep && rep.quality !== "good") this.log(rep.summary + " (see the microphone report above)", "mic " + rep.quality, "note");
+    }
+    const m = await openMic();
+    this.ctx = m.ctx; this.node = m.node; this.stream = m.stream;
     const proto = location.protocol === "https:" ? "wss" : "ws";
     this.ws = new WebSocket(`${proto}://${location.host}/ws/live`);
     await new Promise((res, rej) => { this.ws.onopen = res; this.ws.onerror = () => rej(new Error("websocket connection failed")); });
@@ -341,7 +475,8 @@ class LiveCall {
     this.ws.onclose = () => { if (this.running) { this.status("connection closed"); this.cleanup(); } };
     this.node.port.onmessage = ev => this.onPcm(ev.data);
     this.running = true;
-    $("#live-start").disabled = true; $("#live-stop").disabled = false; this.status("connecting the agent…");
+    $("#live-stop").disabled = false; this.status("connecting the agent…");
+    resetLivePanel();
     this.pickVoice();
     this.ws.send(JSON.stringify({ type: "start" }));
   }
@@ -358,8 +493,7 @@ class LiveCall {
     const now = this.t();
     if (db > thr) { this.speaking = true; this.lastSpeech = now; }
     else if (this.speaking && now - this.lastSpeech > 0.4) { this.speaking = false; }
-    $("#mic-level").style.width = Math.max(0, Math.min(100, (db + 60) * 1.8)) + "%";
-    $("#mic-level").style.background = this.speaking ? "var(--caller)" : "var(--human)";
+    meter(db, this.speaking);
   }
   sendAgent(ev, text, kind) {
     if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ type: "agent", event: ev, t: this.t(), text, kind }));
@@ -426,13 +560,20 @@ class LiveCall {
     this.history.push(r.p_synthetic);
     const v = $("#live-verdict"); const unsure = r.evidence_level < 0.5;
     v.textContent = unsure ? "…" : r.verdict; v.className = "verdict-big " + (unsure ? "unsure" : r.verdict.toLowerCase());
-    $("#live-conf").textContent = `${pct(r.confidence)} confidence · p=${fmt(r.p_synthetic, 2)} · ${fmt(r.speech_seconds, 1)} s speech · evidence ${pct(r.evidence_level)}`;
+    $("#live-conf").innerHTML = `<b>${pct(r.confidence)}</b> confidence <span class="p">· p(synthetic) = ${fmt(r.p_synthetic, 2)}</span>`;
+    $("#live-meta").textContent = `${fmt(r.speech_seconds, 1)} s of caller speech · evidence ${pct(r.evidence_level)}`;
+    const fill = $("#live-pfill");
+    fill.style.width = (r.p_synthetic * 100) + "%";
+    fill.style.background = unsure ? "var(--warn)" : (r.is_synthetic ? "var(--synthetic)" : "var(--human)");
+    $(".live-verdict .pmark").style.left = (r.p_synthetic * 100) + "%";
+    setLabels($("#live-lab-human"), $("#live-lab-synthetic"), r, unsure);
     const c = $("#live-spark"), ctx = c.getContext("2d"); ctx.clearRect(0, 0, c.width, c.height);
     ctx.fillStyle = "#0a0908"; ctx.fillRect(0, 0, c.width, c.height); ctx.strokeStyle = "#4a443c"; ctx.beginPath(); ctx.moveTo(0, c.height / 2); ctx.lineTo(c.width, c.height / 2); ctx.stroke();
     ctx.strokeStyle = "#ece4d3"; ctx.lineWidth = 2; ctx.beginPath();
     this.history.forEach((p, i) => { const x = (i / Math.max(1, this.history.length - 1)) * c.width, y = c.height - p * c.height; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
     ctx.stroke();
-    $("#live-aspects").innerHTML = Object.values(r.aspects).map(a => `<div><span>${esc(a.label)}</span><div class="bar"><i style="width:${(a.score || 0) * 100}%;background:${scoreColor(a.score)}"></i></div></div>`).join("");
+    $("#live-cues").innerHTML = topCues(r.aspects).map(cueHtml).join("");
+    $("#live-aspects").innerHTML = Object.values(r.aspects).map(a => `<div><span class="n">${esc(a.label)}</span><div class="bar"><i style="width:${(a.score || 0) * 100}%;background:${scoreColor(a.score)}"></i></div></div>`).join("");
     $("#live-events").innerHTML = eventChips(r.events);
   }
   renderFinal(m) {
@@ -456,13 +597,22 @@ class LiveCall {
   }
   cleanup() {
     this.running = false;
-    try { this.node && this.node.disconnect(); this.stream && this.stream.getTracks().forEach(t => t.stop()); this.ctx && this.ctx.close(); } catch (e) { /* ignore */ }
+    closeMic(this);
     setTimeout(() => this.ws && this.ws.close(), 500);
     $("#live-start").disabled = false; $("#live-stop").disabled = true;
   }
+}
+
+function resetLivePanel() {
+  $("#live-verdict").textContent = "—"; $("#live-verdict").className = "verdict-big";
+  $("#live-conf").textContent = "waiting for speech…"; $("#live-meta").textContent = "";
+  $("#live-pfill").style.width = "0%"; $(".live-verdict .pmark").style.left = "50%";
+  setLabels($("#live-lab-human"), $("#live-lab-synthetic"), null, true);
+  $("#live-cues").innerHTML = ""; $("#live-aspects").innerHTML = "";
 }
 
 const live = new LiveCall();
 if (window.speechSynthesis) speechSynthesis.onvoiceschanged = () => live.pickVoice();
 $("#live-start").addEventListener("click", async () => { try { await live.start(); } catch (e) { live.status("could not start: " + e.message); live.cleanup(); } });
 $("#live-stop").addEventListener("click", () => live.stop());
+$("#mic-test").addEventListener("click", () => micCheck());

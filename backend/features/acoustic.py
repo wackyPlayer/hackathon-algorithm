@@ -26,7 +26,7 @@ from scipy.linalg import solve_toeplitz
 from scipy.ndimage import binary_dilation, gaussian_filter1d, uniform_filter1d
 
 from ..audio import Call
-from ..vad import EPS, HOP, HOP_S, SR, WIN, Vad
+from ..vad import EPS, HOP, HOP_S, SR, WIN, Vad, mask_from_segments
 
 _HANN = np.hanning(WIN).astype(np.float32)
 _HANN_AC = None  # autocorrelation of the analysis window (lazy)
@@ -140,6 +140,12 @@ def ltas_features(P: np.ndarray, freqs: np.ndarray, speech: np.ndarray) -> dict:
     out["ltas_peakiness_db"] = _safe(resid.std())
     hp = mean_p[_band(freqs, 3400, 4001)]
     out["ltas_high_flatness"] = _safe(np.exp(np.log(hp + EPS).mean()) / (hp.mean() + EPS))
+    # frame-to-frame swing of the high band relative to the low band (fricative/vowel contrast; a TTS
+    # front-end keeps it steadier than a handset microphone)
+    hf = 10 * np.log10(Ps[_band(freqs, 2500, 3800)].sum(axis=0) + EPS)
+    lf = 10 * np.log10(Ps[_band(freqs, 300, 1000)].sum(axis=0) + EPS)
+    out["ltas_hf_lf_frame_std_db"] = _safe((hf - lf).std())
+    out["ltas_hf_lf_frame_p90_p10_db"] = _safe(np.percentile(hf - lf, 90) - np.percentile(hf - lf, 10))
     return out
 
 
@@ -251,6 +257,18 @@ def rhythm_features(P: np.ndarray, freqs: np.ndarray, vad: Vad) -> dict:
             k = ((peaks >= a) & (peaks < b)).sum()
             rates.append(k / (sp[a:b].sum() * HOP_S + 1e-3))
     out["rhythm_rate_cv"] = _cv(np.array(rates)) if len(rates) >= 3 else float("nan")
+    # inter-syllable-peak intervals inside phrases: machine rhythm is more regular than a person's
+    ipi = []
+    for s, e in vad.phrases:
+        a, b = int(s / HOP_S), int(e / HOP_S)
+        pk = peaks[(peaks >= a) & (peaks < b)]
+        if pk.size >= 3:
+            ipi.extend((np.diff(pk) * HOP_S * 1000.0).tolist())
+    if len(ipi) >= 8:
+        ipi_a = np.array(ipi)
+        out["rhythm_ipi_cv"] = _cv(ipi_a)
+        out["rhythm_ipi_median_ms"] = _safe(np.median(ipi_a))
+        out["rhythm_ipi_iqr_ms"] = _safe(np.percentile(ipi_a, 75) - np.percentile(ipi_a, 25))
     L = 256
     spec_acc = np.zeros(L // 2 + 1)
     k = 0
@@ -332,6 +350,21 @@ def floor_features(call: Call, P: np.ndarray, freqs: np.ndarray, vad: Vad, desc:
     if ns.sum() >= 5:
         out["floor_zero_hop_frac"] = _safe((hop_max[ns] <= 2.0 / 32768).mean())
         out["floor_quiet_hop_frac"] = _safe((hop_max[ns] <= 16.0 / 32768).mean())
+    # pauses *inside* caller turns vs. silence *between* turns: a person's microphone sounds the same in
+    # both; injected TTS carries the engine's own (often digital) silence inside a turn and the channel
+    # floor between turns
+    in_turn = mask_from_segments(vad.turns, n)
+    intra = in_turn & ~binary_dilation(vad.speech, iterations=2)
+    inter = ~binary_dilation(in_turn, iterations=5) & ~vad.speech
+    if intra.sum() >= 10 and inter.sum() >= 10:
+        dbi, dbo = vad.db[intra], vad.db[inter]
+        out["floor_intra_pause_db"] = _safe(np.median(dbi))
+        out["floor_intra_minus_inter_db"] = _safe(np.median(dbi) - np.median(dbo))
+        out["floor_intra_pause_std_db"] = _safe(dbi.std())
+        out["floor_intra_pause_flatness"] = _safe(desc["flatness"][intra].mean())
+        out["floor_intra_zero_hop_frac"] = _safe((hop_max[intra] <= 2.0 / 32768).mean())
+        out["floor_intra_quiet_hop_frac"] = _safe((hop_max[intra] <= 16.0 / 32768).mean())
+        out["floor_intra_frac"] = _safe(intra.sum() / max(in_turn.sum(), 1))
     if len(raw):
         out["level_peak_dbfs"] = _safe(20 * np.log10(np.abs(raw).max() + EPS))
         out["level_clip_frac"] = _safe((np.abs(raw) >= 0.985).mean())
@@ -518,6 +551,39 @@ def channel_features(call: Call, vad_c: Vad, vad_a: Vad | None) -> dict:
     return out
 
 
+def turn_consistency_features(P: np.ndarray, freqs: np.ndarray, vad: Vad, desc: dict) -> dict:
+    """How much level, spectral tilt, high-band balance and centroid change from one caller turn to the
+    next. A TTS engine renders every utterance with the same normalised level and the same spectral
+    signature; a person moves the handset, changes effort and posture between turns."""
+    out: dict = {}
+    vb = _band(freqs, 300, 3400)
+    x = np.log2(freqs[vb])
+    hfm, lfm = _band(freqs, 2500, 3800), _band(freqs, 300, 1000)
+    rows = []
+    for s, e in vad.turns:
+        a, b = int(round(s / HOP_S)), int(round(e / HOP_S))
+        sp = vad.speech[a:b]
+        if sp.sum() < 60:
+            continue
+        idx = a + np.flatnonzero(sp)
+        Pt = P[:, idx]
+        ltas = 10 * np.log10(np.median(Pt, axis=1) + EPS)
+        tilt = np.polyfit(x, ltas[vb], 1)[0]
+        mp = Pt.mean(axis=1)
+        hf = 10 * np.log10(mp[hfm].mean() + EPS) - 10 * np.log10(mp[lfm].mean() + EPS)
+        rows.append((float(vad.db[idx].mean()), float(vad.db[idx].max()), float(tilt), float(hf), float(desc["centroid"][idx].mean())))
+    if len(rows) >= 3:
+        R = np.array(rows)
+        out["level_turn_rms_std_db"] = _safe(R[:, 0].std())
+        out["level_turn_range_db"] = _safe(R[:, 0].max() - R[:, 0].min())
+        out["level_turn_peak_std_db"] = _safe(R[:, 1].std())
+        out["ltas_tilt_turn_std"] = _safe(R[:, 2].std())
+        out["ltas_hf_turn_std_db"] = _safe(R[:, 3].std())
+        out["ltas_hf_turn_mean_db"] = _safe(R[:, 3].mean())
+        out["spec_centroid_turn_std"] = _safe(R[:, 4].std())
+    return out
+
+
 def spectrogram_ui(P: np.ndarray, freqs: np.ndarray, max_cols: int = 1200, rows: int = 128) -> dict:
     n_bins, n = P.shape
     if n == 0:
@@ -529,8 +595,11 @@ def spectrogram_ui(P: np.ndarray, freqs: np.ndarray, max_cols: int = 1200, rows:
         pad = (-n) % step
         R = np.pad(R, ((0, 0), (0, pad)), constant_values=0).reshape(rows, -1, step).max(axis=2)
     D = 10 * np.log10(R + EPS)
-    lo, hi = np.percentile(D, 3), np.percentile(D, 99.5)
-    U = np.clip((D - lo) / max(hi - lo, 1e-3), 0, 1)
+    # map a fixed 55 dB window below the loudest bins (not "silence floor .. peak"): speech no longer
+    # saturates the colour map and the noise floor stays dark, so harmonics and formants are readable
+    hi = float(np.percentile(D, 99.5))
+    lo = max(float(np.percentile(D, 3)), hi - 55.0)
+    U = np.clip((D - lo) / max(hi - lo, 1e-3), 0, 1) ** 1.25
     U = (U[::-1] * 255).astype(np.uint8)
     return {"rows": rows, "cols": int(U.shape[1]), "hop_s": step * HOP_S,
             "fmax": float(freqs[(n_bins // rows) * rows - 1]),
@@ -554,6 +623,7 @@ def acoustic_features(call: Call, P: np.ndarray, freqs: np.ndarray, vad_c: Vad, 
     feats.update(rhythm_features(P, freqs, vad_c))
     feats.update(cepstral_features(P, freqs, vad_c.speech))
     feats.update(spectral_shape_features(desc, vad_c.speech))
+    feats.update(turn_consistency_features(P, freqs, vad_c, desc))
     feats.update(floor_features(call, P, freqs, vad_c, desc))
     feats.update(cut_features(vad_c))
     bf, breaths = breath_features(vad_c, desc, call.duration)

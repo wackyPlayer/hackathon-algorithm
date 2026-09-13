@@ -18,7 +18,7 @@ from ..features.acoustic import acoustic_features
 from ..features.conversational import conversational_features
 from ..vad import Vad, stft_power, vad_from_power, vad_from_segments
 from . import heuristics
-from .model import Detector, fuse_probabilities
+from .model import Detector, fuse_heads, fuse_probabilities
 
 log = logging.getLogger("detector.pipeline")
 
@@ -107,11 +107,14 @@ class Analyzer:
         aspects = heuristics.aspect_scores(feats)
         p_heur = heuristics.heuristic_probability(aspects)
         contributions: dict = {}
+        p_ac = None
         if self.detector is not None:
-            p_fast = self.detector.predict_proba(feats)
+            p_main = self.detector.predict_proba(feats)
+            p_ac = self.detector.predict_acoustic(feats)
+            p_fast = fuse_heads(p_main, p_ac, self.detector.fusion_rule)
             contributions = self.detector.contributions(feats)
         else:
-            p_fast = p_heur
+            p_main = p_fast = p_heur
         p_embed = self._embedding_prob(call, ex.vad_c)
         weights = {"fast": settings.w_fast, "embed": settings.w_embed, "semantic": settings.w_semantic}
         fusion = self.detector.fusion if self.detector else None
@@ -151,6 +154,8 @@ class Analyzer:
             "mode": self.mode,
             "signals": {
                 "fast_model_p": round(float(p_fast), 4),
+                "main_model_p": round(float(p_main), 4),
+                "acoustic_p": None if p_ac is None else round(float(p_ac), 4),
                 "heuristic_p": round(float(p_heur), 4),
                 "embedding_p": None if p_embed is None else round(float(p_embed), 4),
                 "semantic_p": None if p_sem is None else round(float(p_sem), 4),

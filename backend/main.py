@@ -230,6 +230,35 @@ async def index():
     return FileResponse(p)
 
 
+# ----------------------------------------------------------------------------- microphone check (live call)
+
+@app.post("/miccheck")
+async def miccheck(request: Request, ns: int = 0, agc: int = 0, ec: int = 0, sr: int = 0, device: str = ""):
+    """Microphone quality check before a live call. Body: raw int16 8 kHz PCM (application/octet-stream) or a
+    WAV / base64 JSON like /detect. Query: ns/agc/ec = the browser's noiseSuppression / autoGainControl /
+    echoCancellation flags as actually applied, sr = device sample rate, device = its label.
+    Returns {quality: good|fair|poor, summary, warnings[{level, risk, text}], metrics}."""
+    from .miccheck import mic_check_report
+    from .scoring.pipeline import extract
+    body = await request.body()
+    ct = request.headers.get("content-type", "").lower()
+    if body and not looks_like_wav(body) and ("octet-stream" in ct or not ct):
+        x = np.frombuffer(body[: len(body) // 2 * 2], dtype="<i2").astype(np.float32) / 32768.0
+        call = call_from_arrays(x, None)
+    else:
+        call = _load(await read_audio_bytes(request))
+    if call.duration < 0.5:
+        raise HTTPException(400, "sample too short (send at least 2 s of audio)")
+    ex = await run_in_threadpool(extract, call, None, False)
+    client = {"noise_suppression": bool(ns), "auto_gain": bool(agc), "echo_cancellation": bool(ec),
+              "sample_rate": sr or None, "device": device[:80]}
+    rep = mic_check_report(ex.features, client)
+    rep["duration_seconds"] = round(call.duration, 2)
+    log.info("/miccheck %.1fs: quality=%s snr=%s floor=%s warnings=%d", call.duration, rep["quality"],
+             rep["metrics"]["snr_db"], rep["metrics"]["floor_dbfs"], len(rep["warnings"]))
+    return JSONResponse(rep)
+
+
 # ----------------------------------------------------------------------------- demo samples (optional)
 
 SAMPLES_DIR = os.getenv("SAMPLES_DIR", "")

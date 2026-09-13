@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Altur Voice Shield</title>
 <link rel="preload" href="/static/fonts/MonsterFriendFore.otf" as="font" type="font/otf" crossorigin>
+<link rel="preload" href="/static/fonts/monobit.ttf" as="font" type="font/ttf" crossorigin>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -13,7 +14,7 @@
     <span class="logo">&#9673;</span>
     <div>
       <h1>Altur Voice Shield</h1>
-      <div class="sub">Real-time synthetic caller detection · caller = channel 0, agent = channel 1</div>
+      <div class="sub meta">Real-time synthetic caller detection · caller = channel 0, agent = channel 1</div>
     </div>
   </div>
   <div class="live-controls">
@@ -44,7 +45,7 @@
         <div id="samples-box" class="hidden">
           <label>Or pick a dataset call: <select id="sample"></select> <button id="sample-go">Analyze</button></label>
         </div>
-        <div id="progress" class="muted"></div>
+        <div id="progress" class="meta"></div>
       </div>
     </div>
     <div id="batch" class="card hidden"></div>
@@ -56,24 +57,31 @@
     <div class="row">
       <div class="card grow">
         <div class="live-controls">
+          <button id="mic-test">Test microphone</button>
           <button id="live-start" class="primary">Start call</button>
           <button id="live-stop" disabled>End call &amp; get verdict</button>
-          <span id="live-status" class="muted">idle</span>
+          <span id="live-status" class="meta">idle</span>
           <span class="meter"><span id="mic-level"></span></span>
         </div>
+        <div id="mic-report" class="mic-report hidden"></div>
         <p class="muted small">You are the caller. The bank agent "Marina" is generated live: Gemini writes each line from what you
           just said, ElevenLabs speaks it (browser voice if no key is configured), and Whisper on the server hears you.
           The agent runs the same verification flow as Altur's: greeting, a question it deliberately interrupts, a folio
           you must repeat back, a probe about an insurance product that does not exist, a 5-second silence, a last
-          question, a closing. Your microphone is streamed at 8 kHz; the verdict updates every 2 seconds.</p>
+          question, a closing. Your microphone is streamed at 8 kHz; the verdict updates every 2 seconds. The microphone
+          is checked first (2 s of silence, then a sentence) so you know whether this input could bias the verdict.</p>
         <div id="agent-log" class="agent-log"></div>
       </div>
       <div class="card live-verdict">
-        <div class="verdict-label muted">rolling verdict</div>
+        <div class="meta">rolling verdict</div>
         <div id="live-verdict" class="verdict-big">—</div>
-        <div id="live-conf" class="muted">waiting for speech…</div>
-        <canvas id="live-spark" width="320" height="80"></canvas>
-        <div id="live-aspects" class="mini-aspects"></div>
+        <div id="live-conf" class="verdict-conf">waiting for speech…</div>
+        <div id="live-meta" class="meta"></div>
+        <div class="pbar"><div id="live-pfill" class="pfill"></div><div class="pmark"></div></div>
+        <div class="pbar-labels"><span id="live-lab-human" class="lab human">Human</span><span id="live-lab-synthetic" class="lab synthetic">Synthetic</span></div>
+        <canvas id="live-spark" width="340" height="70"></canvas>
+        <div id="live-cues" class="cues"></div>
+        <details class="section"><summary>All indicators</summary><div id="live-aspects" class="mini-aspects"></div></details>
       </div>
     </div>
     <div id="live-events" class="card events"></div>
@@ -98,6 +106,7 @@
       <h2>Other routes</h2>
       <p><code>GET /health</code> · <code>GET /samples</code> · <code>POST /analyze?sample=name.wav</code> ·
         <code>WS /ws/live</code> (live call: int16 8 kHz PCM frames in, agent lines and rolling verdicts out) ·
+        <code>POST /miccheck</code> (microphone quality report for a short PCM sample) ·
         <code>GET /share</code> (public / LAN links for this server).</p>
       <h2>Sharing</h2>
       <p>On the host run <code>share.ps1</code> (Windows) or <code>share.sh</code>: it opens a public HTTPS tunnel
@@ -113,25 +122,16 @@
   <div class="card verdict-card">
     <div class="verdict-main">
       <div class="verdict-big" data-f="verdict">—</div>
-      <div class="verdict-meta">
-        <div><b data-f="confidence"></b> confidence · p(synthetic) = <span data-f="p"></span></div>
-        <div class="muted small" data-f="meta"></div>
-      </div>
+      <div class="verdict-conf"><b data-f="confidence"></b> confidence <span class="p">· p(synthetic) = <span data-f="p"></span></span></div>
     </div>
+    <div class="meta" data-f="meta"></div>
     <div class="pbar"><div class="pfill" data-f="pfill"></div><div class="pmark"></div></div>
-    <div class="pbar-labels"><span>human</span><span>synthetic</span></div>
-  </div>
-  <div class="grid2">
-    <div class="card">
-      <h2>Voice &amp; behaviour rating <span class="muted small">(0 = human-like, 100 = synthetic-like)</span></h2>
+    <div class="pbar-labels"><span class="lab human" data-f="lab-human">Human</span><span class="lab synthetic" data-f="lab-synthetic">Synthetic</span></div>
+    <div class="cues" data-f="cues"></div>
+    <details class="section" data-f="ind">
+      <summary>Why this result · all indicators <span class="hint">(0 = human-like, 100 = synthetic-like; click one for its measurements)</span></summary>
       <div data-f="aspects" class="aspects"></div>
-    </div>
-    <div class="card">
-      <h2>Attack profile <span class="muted small">(share of the synthetic probability)</span></h2>
-      <div data-f="attacks" class="attacks"></div>
-      <h2 class="mt">Signals</h2>
-      <div data-f="signals" class="signals"></div>
-    </div>
+    </details>
   </div>
   <div class="card">
     <h2>Caller spectrogram &amp; turn timeline</h2>
@@ -144,15 +144,28 @@
     </div>
     <div data-f="events" class="events"></div>
   </div>
-  <div class="card" data-f="contrib-card">
-    <h2>Why the model decided <span class="muted small">(logit contributions, trained model)</span></h2>
+  <details class="card section" data-f="attack-card">
+    <summary>Attack profile &amp; model signals</summary>
+    <div class="grid2">
+      <div>
+        <h2>Attack profile <span class="hint">(share of the synthetic probability)</span></h2>
+        <div data-f="attacks" class="attacks"></div>
+      </div>
+      <div>
+        <h2>Signals</h2>
+        <div data-f="signals" class="signals"></div>
+      </div>
+    </div>
+  </details>
+  <details class="card section" data-f="contrib-card">
+    <summary>Why the model decided <span class="hint">(logit contributions of the trained model)</span></summary>
     <div data-f="contrib"></div>
-  </div>
+  </details>
   <div class="card hidden" data-f="sem-card">
     <h2>Transcript &amp; semantic judge</h2>
     <div data-f="sem"></div>
   </div>
-  <details class="card"><summary>Raw JSON</summary><pre data-f="raw"></pre></details>
+  <details class="card section"><summary>Raw JSON</summary><pre data-f="raw"></pre></details>
 </template>
 
 <script src="/static/app.js"></script>

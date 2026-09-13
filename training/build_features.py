@@ -8,6 +8,8 @@ Optional:
     --clip SECONDS     also add clipped variants (first N seconds of the call) as extra training rows
                        so the model sees short excerpts too (ids get a "#clipN" suffix).
     --embeddings       also compute SSL embeddings (needs torch + transformers) -> data/embeddings.npz
+    --extra DIR CSV    additional labelled corpus (e.g. data/tts_corpus built by training/tts_corpus.py); its
+                       manifest may carry `group` (cross-validation group) and `source` columns
 """
 from __future__ import annotations
 
@@ -56,13 +58,18 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--clip", type=float, action="append", default=[])
     ap.add_argument("--embeddings", action="store_true")
+    ap.add_argument("--extra", nargs=2, action="append", default=[], metavar=("AUDIO_DIR", "MANIFEST"))
     a = ap.parse_args()
 
-    rows = list(csv.DictReader(open(a.manifest, encoding="utf-8")))
+    rows = [dict(r, _dir=a.audio, _source="dataset") for r in csv.DictReader(open(a.manifest, encoding="utf-8"))]
     if a.limit:
         rows = rows[: a.limit]
+    for d, m in a.extra:
+        extra = [dict(r, _dir=d, _source=(r.get("source") or "extra")) for r in csv.DictReader(open(m, encoding="utf-8"))]
+        print(f"extra corpus {m}: {len(extra)} calls")
+        rows.extend(extra)
     meta = {r["anon_id"]: r for r in rows}
-    jobs = [(r["anon_id"], os.path.join(a.audio, r["anon_id"] + ".wav"), a.clip) for r in rows]
+    jobs = [(r["anon_id"], os.path.join(r["_dir"], r["anon_id"] + ".wav"), a.clip) for r in rows]
     t0 = time.time()
     results: dict = {}
     errors = []
@@ -80,12 +87,12 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     with open(a.out, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["id", "anon_id", "label", "split", "duration_s"] + keys)
+        w.writerow(["id", "anon_id", "label", "split", "duration_s", "group", "source"] + keys)
         for rid in sorted(results):
             base = rid.split("#")[0]
             m = meta[base]
             f = results[rid]
-            w.writerow([rid, base, m["label"], m["split"], m.get("duration_s", "")] +
+            w.writerow([rid, base, m["label"], m["split"], m.get("duration_s", ""), m.get("group") or base, m["_source"]] +
                        [("" if (f.get(k) is None or not np.isfinite(f.get(k, np.nan))) else f[k]) for k in keys])
     print(f"wrote {a.out}: {len(results)} rows x {len(keys)} features in {time.time() - t0:.0f}s; errors: {len(errors)}")
     for e in errors[:10]:

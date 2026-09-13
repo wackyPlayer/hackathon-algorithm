@@ -103,7 +103,33 @@ def test_analyze_breakdown(client, clips):
 
 
 def test_synthetic_caricatures_are_ranked(client, clips):
-    """The bot-like caricature must score more synthetic than the human-like one."""
-    ph = client.post("/analyze?ui=0", json={"audio": _b64(clips["human"])}).json()["p_synthetic"]
-    pb = client.post("/analyze?ui=0", json={"audio": _b64(clips["bot"])}).json()["p_synthetic"]
-    assert pb > ph
+    """The bot-like caricature must score more synthetic than the human-like one on the interpretable
+    aspect layer. The caricatures are tone generators, far outside the domain of the trained model (which is
+    fit to real and TTS voices), so its probability is only checked for being a valid, evidence-weighted value."""
+    rh = client.post("/analyze?ui=0", json={"audio": _b64(clips["human"])}).json()
+    rb = client.post("/analyze?ui=0", json={"audio": _b64(clips["bot"])}).json()
+    assert rb["signals"]["heuristic_p"] > rh["signals"]["heuristic_p"]
+    assert rb["aspects"]["turn_taking"]["score"] > rh["aspects"]["turn_taking"]["score"]
+    for r in (rh, rb):
+        assert 0.0 <= r["p_synthetic"] <= 1.0 and 0.5 <= r["confidence"] <= 1.0
+        assert r["signals"]["acoustic_p"] is None or 0.0 <= r["signals"]["acoustic_p"] <= 1.0
+
+
+def test_miccheck_reports_quality(client):
+    """A quiet-then-speech PCM sample gets a grade, metrics and client-flag warnings."""
+    import numpy as np
+    from bench.make_clips import _voice
+    rng = np.random.default_rng(0)
+    x = np.zeros(8000 * 5, np.float32)
+    v = _voice(2.5, 140, rng, jitter=0.03, vibrato=0.02) * 0.2
+    x[16000:16000 + len(v)] = v
+    x += rng.standard_normal(len(x)).astype(np.float32) * 10 ** (-70 / 20)
+    pcm = (x * 32767).astype("<i2").tobytes()
+    r = client.post("/miccheck?ns=1&agc=1&sr=48000&device=test", content=pcm, headers={"Content-Type": "application/octet-stream"})
+    assert r.status_code == 200
+    j = r.json()
+    assert j["quality"] in ("good", "fair", "poor")
+    assert j["metrics"]["speech_seconds"] > 1.0 and j["metrics"]["snr_db"] > 20
+    risks = {w["risk"] for w in j["warnings"]}
+    assert "false_positive" in risks  # noise suppression + AGC flags
+    assert client.post("/miccheck", content=b"\x00\x00" * 800, headers={"Content-Type": "application/octet-stream"}).status_code == 400

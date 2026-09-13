@@ -10,6 +10,9 @@ Saved payload (dict):
   meta            dict of training metrics / notes
   embedding_head  optional dict {clf, dim, model_name, layer} for SSL embeddings
   fusion          optional dict {"weights": {...}, "bias": float} learned on out-of-fold logits
+  acoustic_head   optional dict {clf, feature_names, medians}: acoustic-only model (no conversational /
+                  cross-channel features) that catches a synthetic *voice* even with human-like timing
+  fusion_rule     optional dict {"kind": max|mean|stack, ...} joining the acoustic head with the main model
 """
 from __future__ import annotations
 
@@ -57,6 +60,8 @@ class Detector:
     meta: dict = field(default_factory=dict)
     embedding_head: dict | None = None
     fusion: dict | None = None
+    acoustic_head: dict | None = None
+    fusion_rule: dict | None = None
     path: str = ""
 
     # ------------------------------------------------------------------ loading
@@ -69,7 +74,8 @@ class Detector:
             d = joblib.load(path)
             det = cls(kind=d["kind"], feature_names=list(d["feature_names"]), medians=np.asarray(d["medians"]),
                       clf=d["clf"], base_lr=d.get("base_lr"), scaler=d.get("scaler"), meta=d.get("meta", {}),
-                      embedding_head=d.get("embedding_head"), fusion=d.get("fusion"), path=path)
+                      embedding_head=d.get("embedding_head"), fusion=d.get("fusion"), path=path,
+                      acoustic_head=d.get("acoustic_head"), fusion_rule=d.get("fusion_rule"))
             log.info("loaded detector %s (%s, %d features) meta=%s", path, det.kind, len(det.feature_names),
                      {k: v for k, v in det.meta.items() if not isinstance(v, (list, dict))})
             return det
@@ -103,6 +109,16 @@ class Detector:
         feats = [{"feature": self.feature_names[i], "value": float(v[0, i]), "contribution": float(c[i])} for i in order]
         return {"groups": groups, "top_features": feats, "intercept": float(self.base_lr.intercept_[0])}
 
+    def predict_acoustic(self, features: dict) -> float | None:
+        """Acoustic-only head probability (None when the model has no such head)."""
+        h = self.acoustic_head
+        if not h:
+            return None
+        v = np.array([features.get(n, np.nan) for n in h["feature_names"]], dtype=np.float64)
+        bad = ~np.isfinite(v)
+        v[bad] = np.asarray(h["medians"])[bad]
+        return float(h["clf"].predict_proba(v[None, :])[0, 1])
+
     def predict_embedding(self, emb: np.ndarray) -> float | None:
         if self.embedding_head is None or emb is None:
             return None
@@ -132,3 +148,21 @@ def fuse_probabilities(p_fast: float, p_embed: float | None, p_sem: float | None
     num = sum(defaults.get(k, 1.0) * _logit(p) for k, p in avail)
     den = sum(defaults.get(k, 1.0) for k, _ in avail) or 1.0
     return _sigmoid(num / den)
+
+
+def fuse_heads(p_main: float, p_acoustic: float | None, rule: dict | None) -> float:
+    """Join the main model with the acoustic-only head in logit space.
+    max:   the acoustic head can only *add* synthetic evidence (never makes a call look more human);
+    mean:  average of the two logits;
+    stack: learned weights (w_main, w_ac, bias) fitted on out-of-fold train logits."""
+    if p_acoustic is None or not rule or rule.get("kind") in (None, "none"):
+        return p_main
+    zm, za = _logit(p_main), _logit(p_acoustic)
+    k = rule.get("kind")
+    if k == "max":
+        return _sigmoid(max(zm, za))
+    if k == "mean":
+        return _sigmoid(0.5 * (zm + za))
+    if k == "stack":
+        return _sigmoid(float(rule.get("bias", 0.0)) + float(rule.get("w_main", 1.0)) * zm + float(rule.get("w_ac", 1.0)) * za)
+    return p_main
