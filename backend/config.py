@@ -53,6 +53,16 @@ class Settings:
 
     # --- decision ---
     decision_threshold: float = _f("DECISION_THRESHOLD", 0.5)
+    # What /detect puts in "confidence". The brief says confidence breaks ties and rewards well-calibrated
+    # systems, and both of those need a number that is monotone in the thing being decided: p(synthetic)
+    # ranks every call on one axis and can be scored for calibration directly, whereas p(verdict correct)
+    # folds the scale in half (0.02 and 0.98 both come back as 0.98), which destroys the ranking.
+    #   p_synthetic  (default)  is_synthetic == (confidence >= 0.5) always holds
+    #   p_correct               max(p, 1-p), the old behaviour, if a harness asks for it
+    confidence_semantics: str = _s("CONFIDENCE_SEMANTICS", "p_synthetic")
+    # Never report absolute certainty: a saturated linear model returns 1.0 on inputs it has never seen,
+    # and a confidently wrong answer is worse than a hedged one.
+    confidence_cap: float = _f("CONFIDENCE_CAP", 0.995)
     # below this much caller speech the verdict is pulled toward 0.5 (not enough evidence)
     min_speech_seconds: float = _f("MIN_SPEECH_SECONDS", 1.5)
     full_confidence_speech_seconds: float = _f("FULL_CONFIDENCE_SPEECH_SECONDS", 8.0)
@@ -99,9 +109,17 @@ class Settings:
     live_max_utterance_s: float = _f("LIVE_MAX_UTTERANCE_S", 20.0)    # a caller turn is cut here (monologue or noise)
     live_speech_rise_db: float = _f("LIVE_SPEECH_RISE_DB", 8.0)       # speech = this far above the tracked noise floor
     live_talk_mod_db: float = _f("LIVE_TALK_MOD_DB", 3.0)            # talking swings > this over 0.8 s; steady = background noise
-    live_peak_margin_db: float = _f("LIVE_PEAK_MARGIN_DB", 12.0)      # blocks quieter than the caller's own peaks by more are background
-    live_peak_margin_db: float = _f("LIVE_PEAK_MARGIN_DB", 12.0)      # blocks quieter than the caller's own peaks by more are background
-    live_peak_margin_db: float = _f("LIVE_PEAK_MARGIN_DB", 12.0)      # blocks quieter than the caller's own peaks by more are background
+    live_peak_margin_db: float = _f("LIVE_PEAK_MARGIN_DB", 18.0)      # blocks quieter than the caller's own peaks by more are background
+    # Spectral flatness below this means the block has harmonic structure, i.e. somebody (or something) is
+    # speaking. This is the gate that decides speech-vs-noise, NOT the level swing: a fan and a synthetic
+    # voice are both steady in level, and only one of them is a caller.
+    live_voiced_flatness: float = _f("LIVE_VOICED_FLATNESS", 0.35)
+    # How much trailing audio a rolling verdict looks at. The analysis costs ~175 MB per minute of audio
+    # (scipy's STFT builds a complex128 intermediate), and the live call re-runs it every 2 s, so an
+    # unbounded window reached 1.4 GB per pass on an 8-minute call. The model is already fully confident
+    # by ~20 s of caller speech, so 90 s is generous and keeps memory flat. The closing verdict still
+    # sees the whole call (capped by MAX_SECONDS).
+    live_window_s: float = _f("LIVE_WINDOW_S", 90.0)
     live_escalate_p: float = _f("LIVE_ESCALATE_P", 0.70)             # call-average p(synthetic) that escalates the agent's questions
 
     # --- misc ---

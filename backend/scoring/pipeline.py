@@ -142,8 +142,13 @@ class Analyzer:
         lo, hi = settings.min_speech_seconds, settings.full_confidence_speech_seconds
         evid = 0.0 if speech_s <= lo else min(1.0, (speech_s - lo) / max(hi - lo, 1e-6))
         p_final = 0.5 + (p - 0.5) * evid
-        is_syn = bool(p_final >= settings.decision_threshold)
-        confidence = float(max(p_final, 1.0 - p_final))
+        # A clip with no usable caller speech lands exactly on the threshold. Breaking that tie toward
+        # SYNTHETIC would accuse a customer on the strength of no evidence at all, so it breaks the other
+        # way: we only say synthetic when something actually pushed it there.
+        is_syn = bool(p_final > settings.decision_threshold)
+        cap = min(max(settings.confidence_cap, 0.5), 1.0)
+        p_report = float(min(max(p_final, 1.0 - cap), cap))
+        confidence = p_report if settings.confidence_semantics == "p_synthetic" else float(max(p_report, 1.0 - p_report))
         attacks = heuristics.attack_profile(aspects, feats, p_final)
 
         out = {

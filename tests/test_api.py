@@ -51,8 +51,45 @@ def test_detect_json_contract(client, clips):
     j = r.json()
     assert set(j.keys()) == {"is_synthetic", "confidence"}
     assert isinstance(j["is_synthetic"], bool)
-    assert 0.5 <= j["confidence"] <= 1.0
+    # confidence is p(synthetic): monotone, usable for ranking and calibration, and always agreeing
+    # with the boolean. It is also capped, so we never claim to be certain.
+    assert 0.0 <= j["confidence"] <= 1.0
+    assert j["is_synthetic"] == (j["confidence"] > 0.5)
+    assert j["confidence"] <= 0.995
     assert dt < 10
+
+
+def test_detect_confidence_never_saturates(client, clips):
+    """A verdict reported at exactly 1.0 cannot be wrong, and this one can."""
+    for name in ("bot", "human"):
+        j = client.post("/detect", json={"audio": _b64(clips[name])}).json()
+        assert 0.005 <= j["confidence"] <= 0.995
+
+
+def test_detect_rejects_implausible_sample_rate(client, clips):
+    """The WAV header is attacker-controlled and resampling cost scales with it, so a nonsense rate is
+    refused up front instead of turning a short clip into minutes of CPU."""
+    import struct
+    raw = bytearray(clips["bot"])
+    i = raw.find(b"fmt ")
+    struct.pack_into("<I", raw, i + 12, 200)
+    t0 = time.time()
+    r = client.post("/detect", data=bytes(raw), headers={"content-type": "application/octet-stream"})
+    assert r.status_code == 400
+    assert time.time() - t0 < 3
+
+
+def test_detect_no_evidence_does_not_accuse(client):
+    """With too little caller speech to judge, the tie breaks toward human: we do not accuse on silence."""
+    import io
+
+    import numpy as np
+    import soundfile as sf
+    x = (np.random.default_rng(0).standard_normal(1600) * 0.01).astype("float32")
+    b = io.BytesIO()
+    sf.write(b, np.stack([x, x], axis=1), 8000, format="WAV", subtype="PCM_16")
+    j = client.post("/detect", json={"audio": _b64(b.getvalue())}).json()
+    assert j["is_synthetic"] is False
 
 
 @pytest.mark.parametrize("key", ["wav", "audio_base64", "data", "clip"])
@@ -111,7 +148,7 @@ def test_synthetic_caricatures_are_ranked(client, clips):
     assert rb["signals"]["heuristic_p"] > rh["signals"]["heuristic_p"]
     assert rb["aspects"]["turn_taking"]["score"] > rh["aspects"]["turn_taking"]["score"]
     for r in (rh, rb):
-        assert 0.0 <= r["p_synthetic"] <= 1.0 and 0.5 <= r["confidence"] <= 1.0
+        assert 0.0 <= r["p_synthetic"] <= 1.0 and 0.0 <= r["confidence"] <= 1.0
         assert r["signals"]["acoustic_p"] is None or 0.0 <= r["signals"]["acoustic_p"] <= 1.0
 
 

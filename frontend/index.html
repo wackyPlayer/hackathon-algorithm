@@ -3,35 +3,32 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Calliope · autenticación de voz con IA</title>
-<script>try { const t = localStorage.getItem("theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch (e) {}</script>
-<link rel="preload" href="/static/fonts/switzer-400.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="preload" href="/static/fonts/switzer-700.woff2" as="font" type="font/woff2" crossorigin>
+<title>Calliope - deteccion de voz sintetica</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header>
   <div class="brand">
     <svg viewBox="0 0 42 48" aria-hidden="true">
-      <path d="M21 1 C31 1 41 4 41 4 L41 22 C41 36 30 44 21 47 C12 44 1 36 1 22 L1 4 C1 4 11 1 21 1 Z" fill="#2f6be4"/>
-      <g fill="#fff">
-        <rect x="14" y="10" width="2.2" height="6" rx="1.1"/><rect x="18" y="7" width="2.2" height="9" rx="1.1"/><rect x="22" y="9" width="2.2" height="7" rx="1.1"/><rect x="26" y="11" width="2.2" height="5" rx="1.1"/>
-        <path d="M21 18 C17.7 18 15.5 20.3 15.5 23.5 L15.5 26 L13.5 26 L13.5 36 L28.5 36 L28.5 26 L26.5 26 L26.5 23.5 C26.5 20.3 24.3 18 21 18 Z M21 20.4 C22.9 20.4 24.1 21.7 24.1 23.5 L24.1 26 L17.9 26 L17.9 23.5 C17.9 21.7 19.1 20.4 21 20.4 Z"/>
+      <path d="M21 1 C31 1 41 4 41 4 L41 22 C41 36 30 44 21 47 C12 44 1 36 1 22 L1 4 C1 4 11 1 21 1 Z" fill="#1560c4"/>
+      <g fill="#ffffff">
+        <rect x="14" y="14" width="3" height="12"/>
+        <rect x="19" y="10" width="3" height="20"/>
+        <rect x="24" y="16" width="3" height="8"/>
       </g>
-      <circle cx="21" cy="30.5" r="1.6" fill="#2f6be4"/><rect x="20.3" y="30.5" width="1.4" height="2.8" fill="#2f6be4"/>
     </svg>
     <div>
       <div class="wordmark">CALLIOPE</div>
-      <div class="tagline">autenticación de voz con IA · caller = channel 0, agent = channel 1</div>
+      <div class="tagline">deteccion de voz sintetica - canal 0 = quien llama, canal 1 = el agente</div>
     </div>
   </div>
   <div class="header-tools">
     <button id="share-btn" class="hidden">Share link</button>
-    <div id="health" class="pill">connecting…</div>
-    <button id="theme-btn" class="theme-btn" title="Toggle dark mode" aria-label="Toggle dark mode">◐</button>
+    <div id="health" class="pill">connecting...</div>
   </div>
 </header>
-<div id="share-box" class="card hidden" style="margin:12px 28px 0"></div>
+<div id="mic-warning" class="card hidden" style="margin: 12px 20px 0; border-left: 4px solid #c79a1a;"></div>
+<div id="share-box" class="card hidden" style="margin: 12px 20px 0"></div>
 
 <nav class="tabs">
   <button class="tab active" data-tab="analyze">Analyze recording</button>
@@ -117,18 +114,25 @@
   -d "{\"audio\": \"$(base64 -w0 call.wav)\"}"
 
 {"is_synthetic": true, "confidence": 0.93}</pre>
-      <p><code>confidence</code> is the probability that the returned verdict is correct (0.5 – 1.0). The raw
-        <code>p_synthetic</code>, per-aspect scores, attack profile, turn timeline and feature vector are returned by
-        <code>POST /analyze</code> (same body; add <code>?semantic=1</code> to run the transcript judge).</p>
+      <p><code>confidence</code> is p(the caller is synthetic), so it ranks calls and
+        <code>is_synthetic == (confidence &gt; 0.5)</code> always holds. Per-aspect scores, attack profile, turn timeline
+        and the feature vector are returned by <code>POST /analyze</code> (same body; add <code>?semantic=1</code>
+        to run the transcript judge).</p>
       <h2>Other routes</h2>
       <p><code>GET /health</code> · <code>GET /samples</code> · <code>POST /analyze?sample=name.wav</code> ·
         <code>WS /ws/live</code> (live call: int16 8 kHz PCM frames in, agent lines and rolling verdicts out) ·
         <code>POST /miccheck</code> (microphone quality report for a short PCM sample) ·
         <code>GET /share</code> (public / LAN links for this server).</p>
       <h2>Sharing</h2>
-      <p>On the host run <code>share.ps1</code> (Windows) or <code>share.sh</code>: it opens a public HTTPS tunnel
-        (Cloudflare quick tunnel, no account needed) and the <b>Share link</b> button appears in the header. HTTPS is
-        required for other people's microphones in the live call; the analysis endpoints also work over the plain LAN address.</p>
+      <p>The dashboard and every API route work over plain HTTP on the LAN. The <b>live call does not</b>: browsers
+        only give a page the microphone over <code>https://</code> or on <code>localhost</code>, so on a link like
+        <code>http://10.0.0.5:8010</code> the microphone API is simply missing. Two ways to get a link that works
+        on someone else's phone:</p>
+      <p><code>run.ps1 -Https</code> (or <code>HTTPS=1 ./run.sh</code>) serves TLS with a self-signed certificate
+        covering every LAN address of this machine - each device accepts the warning once and the microphone works.
+        <br><code>share.ps1</code> / <code>share.sh</code> opens a public HTTPS tunnel instead; use that one when the
+        wifi blocks device-to-device traffic, which most campus and guest networks do.</p>
+      <p><code>GET /share</code> lists the links and says which of them can run the live call.</p>
       <h2>Health</h2>
       <pre id="health-json">…</pre>
     </div>

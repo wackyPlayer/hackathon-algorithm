@@ -67,7 +67,16 @@ if os.path.isdir(FRONTEND):
 
 @app.get("/share")
 async def share(request: Request):
-    """Links other people can use: the public tunnel URL (written by share.ps1 / share.sh or SHARE_URL) and LAN URLs."""
+    """Links other people can use, and whether each one can actually run the live call.
+
+    The distinction matters and is the usual reason sharing "doesn't work": browsers only expose a
+    microphone in a secure context, which means https:// or localhost. A LAN link like
+    http://10.0.0.5:8010 serves the dashboard and every API route perfectly well, but getUserMedia is
+    simply absent there, so the live call cannot start on a phone or a second laptop. Two ways out --
+    serve TLS ourselves (`run.ps1 -Https` / `HTTPS=1 ./run.sh`, self-signed, one click-through per
+    device) or publish a tunnel (`share.ps1` / `share.sh`), which also gets past guest wifi that blocks
+    device-to-device traffic.
+    """
     public = os.getenv("SHARE_URL", "").strip()
     if not public:
         p = os.path.join(ROOT, "share_url.txt")
@@ -76,16 +85,34 @@ async def share(request: Request):
                 public = open(p, encoding="utf-8").read().strip()
             except OSError:
                 public = ""
-    port = request.url.port or (443 if request.url.scheme == "https" else 80)
-    lan = []
-    try:
-        import socket
-        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
-            if not ip.startswith("127.") and not ip.startswith("169.254."):
-                lan.append(f"http://{ip}:{port}")
-    except Exception:
-        pass
-    return {"public_url": public or None, "lan_urls": lan, "https_required_for_mic": True}
+    scheme = request.url.scheme
+    port = request.url.port or (443 if scheme == "https" else 80)
+    from .tls import lan_addresses
+    lan = [f"{scheme}://{ip}:{port}" for ip in lan_addresses()]
+    tls_on = scheme == "https"
+    if public:
+        best, why = public, "public link over HTTPS: dashboard, API and the live call all work anywhere"
+    elif tls_on and lan:
+        best, why = lan[0], "HTTPS on the local network: the live call works after each device accepts the self-signed certificate once"
+    elif lan:
+        best, why = lan[0], "plain HTTP: the dashboard and the API work, but browsers will NOT give this page a microphone"
+    else:
+        best, why = None, "no network address found"
+    return {
+        "public_url": public or None,
+        "lan_urls": lan,
+        "scheme": scheme,
+        "tls": tls_on,
+        "recommended_url": best,
+        "recommended_note": why,
+        "mic_ok": bool(public or tls_on),
+        "https_required_for_mic": True,
+        "how_to_enable_https": {
+            "windows": f"run.ps1 -Port {port} -Https",
+            "linux_macos": f"HTTPS=1 PORT={port} ./run.sh",
+            "public_tunnel": "share.ps1 (Windows) or ./share.sh - use this when the wifi blocks device-to-device traffic",
+        },
+    }
 
 
 # ----------------------------------------------------------------------------- input parsing
@@ -167,8 +194,12 @@ def _load(data: bytes):
 @app.post("/detect")
 async def detect(request: Request):
     """Scored endpoint. Body: stereo WAV (8 kHz) base64-encoded, e.g. {"audio": "<base64>"}.
-    Returns {"is_synthetic": bool, "confidence": float} where confidence is the probability that
-    the returned verdict is correct (>= 0.5)."""
+
+    Returns {"is_synthetic": bool, "confidence": float}. `confidence` is p(the caller is synthetic), so
+    it is monotone: it ranks calls for tie-breaking and can be scored for calibration directly, and
+    `is_synthetic == (confidence > 0.5)` always holds. Set CONFIDENCE_SEMANTICS=p_correct to return
+    max(p, 1-p) instead if a harness expects that.
+    """
     STATE["requests"] += 1
     data = await read_audio_bytes(request)
     call = _load(data)
@@ -317,10 +348,13 @@ class LiveSession:
 
     Hearing the caller. Every 100 ms block gets a level; the noise floor is the 10th percentile of the last
     15 s (seeded from the microphone check). A block that is `LIVE_SPEECH_RISE_DB` above the floor is not
-    yet speech: background noise sits at a nearly constant level while talking swings from syllable to
-    syllable, so the block is "talking" only if the level swing among the raised blocks of the last 0.8 s
-    (p90 - p10) exceeds `LIVE_TALK_MOD_DB` (3 dB) and it sits within `LIVE_PEAK_MARGIN_DB` of the caller's
-    own recent speech peaks; otherwise it is "noise". A turn opens on a talking block and only counts once it
+    yet speech: it counts as "talking" when it is spectrally voiced (flatness below `LIVE_VOICED_FLATNESS`,
+    i.e. it has harmonic structure) or its level swings from syllable to syllable like speech
+    (p90 - p10 of the raised blocks in the last 0.8 s above `LIVE_TALK_MOD_DB`), and it sits within
+    `LIVE_PEAK_MARGIN_DB` of the caller's own recent speech peaks; otherwise it is "noise". Voicing has to
+    lead: a synthetic caller is level-normalised and steady, so a swing-only rule files it as background
+    noise and the detector never hears the voice it was supposed to catch. Only unvoiced blocks are allowed
+    to raise the noise floor, for the same reason. A turn opens on a talking block and only counts once it
     holds four of them (a level step whose onset mimics a syllable is discarded silently), so a fan, a
     passing car, quieter background voices or an AGC step cannot start a turn or keep it from ending; a
     steady raise that lasts 2 s becomes the new floor. Turns are capped in length and every caller/agent
@@ -332,7 +366,9 @@ class LiveSession:
 
     def __init__(self, ws: WebSocket, analyzer: Analyzer):
         self.ws, self.an = ws, analyzer
-        self.chunks: list = []
+        # One growing buffer, not a list of 100 ms blocks: audio() used to np.concatenate the whole call
+        # on every rolling verdict, copying the entire call every two seconds.
+        self._buf = np.zeros(8000 * 60, np.float32)
         self.n = 0
         self.agent_events: list = []       # {"event": start|end, "t": float, "text": str, "kind": str}
         self.last_analyzed = 0
@@ -360,6 +396,7 @@ class LiveSession:
         self.talk_levels: deque = deque(maxlen=100) # levels of confirmed talking blocks -> caller's own peaks
         self.talk_peak: float | None = None
         self.floor_db = -60.0
+        self.rise_eff = settings.live_speech_rise_db   # adapts to the input's actual dynamic range
         self.seeded = False
         self.level_db, self.mod_db, self.flat = -100.0, 0.0, 1.0
         self.hear = "quiet"                          # quiet | noise | talking (per block)
@@ -379,8 +416,19 @@ class LiveSession:
     def seconds(self) -> float:
         return self.n / 8000.0
 
-    def audio(self) -> np.ndarray:
-        return np.concatenate(self.chunks) if self.chunks else np.zeros(0, np.float32)
+    def audio(self, window_s: float | None = None) -> tuple[np.ndarray, float]:
+        """The captured audio, or its last `window_s` seconds. Returns (samples, start time in the call).
+
+        Bounding this matters more than it looks: a rolling verdict re-analyses what it is given, and the
+        analysis allocates roughly 175 MB per minute of audio (scipy's STFT builds a complex128 intermediate
+        about fourteen times the size of the spectrogram it returns). Re-analysing a whole call every two
+        seconds therefore costs ~1.4 GB per pass by minute eight, and grows from there.
+        """
+        end = self.n
+        if window_s is None or end <= int(window_s * 8000):
+            return self._buf[:end], 0.0
+        start = end - int(window_s * 8000)
+        return self._buf[start:end], start / 8000.0
 
     def seed_floor(self, floor_db) -> None:
         """Start from the noise floor the microphone check measured (dBFS) instead of a guess."""
@@ -396,7 +444,11 @@ class LiveSession:
     def add(self, data: bytes) -> list:
         """Append PCM; return finalized caller utterances [(start_s, end_s)] detected in this chunk."""
         x = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
-        self.chunks.append(x)
+        if self.n + len(x) > len(self._buf):          # amortised doubling, so appends stay O(1)
+            grown = np.zeros(max(len(self._buf) * 2, self.n + len(x)), np.float32)
+            grown[:self.n] = self._buf[:self.n]
+            self._buf = grown
+        self._buf[self.n:self.n + len(x)] = x
         finished = []
         rise, talk_mod, margin = settings.live_speech_rise_db, settings.live_talk_mod_db, settings.live_peak_margin_db
         for i in range(0, len(x), 800):
@@ -412,21 +464,42 @@ class LiveSession:
                     self.floor_db = min(self.floor_db, db)
                 continue
             self.floor_db = float(np.percentile(self.levels, 10))
-            raised = db > max(self.floor_db + rise, -62.0)
+            # How far above the floor a block has to sit before it can be speech. A fixed 8 dB assumes the
+            # input has a talker's natural dynamic range, and a microphone with automatic gain control does
+            # not: it compresses the whole call into a few dB, the threshold can then never be met, and the
+            # session goes deaf -- every caller scored HUMAN for want of any audio. Measured on an
+            # AGC'd capture the level span was 5.9 dB and 1% of blocks cleared floor+8. So scale the
+            # requirement to the range actually present, with a 3 dB floor so noise still cannot pass.
+            span = float(np.percentile(self.levels, 90) - self.floor_db)
+            rise_eff = float(np.clip(0.45 * span, 3.0, rise))
+            self.rise_eff = rise_eff
+            raised = db > max(self.floor_db + rise_eff, -62.0)
             self.blk.append((db, raised))
             # swing of the raised blocks in the window: speech moves syllable to syllable, a level step does not
             up = [d for d, r in self.blk if r]
             pool = up if len(up) >= 4 else [d for d, _ in self.blk]
             self.mod_db = float(np.percentile(pool, 90) - np.percentile(pool, 10)) if len(pool) >= 4 else 0.0
             near_peak = self.talk_peak is None or db >= self.talk_peak - margin
-            if raised and self.mod_db >= talk_mod and near_peak:
+            # Voicing decides speech vs noise. The previous rule used only the level swing ("speech moves
+            # syllable to syllable, background noise does not"), which is true of *people* but is exactly
+            # backwards for the thing we are hunting: synthetic speech is level-normalised and steady, so
+            # it scored as background noise, was dropped before it ever reached the detector, and the call
+            # came back HUMAN for want of any audio. Harmonic structure separates a voice from a fan
+            # without caring who or what produced the voice.
+            voiced = flat < settings.live_voiced_flatness
+            # With a compressed input the bar to be "raised" is only 3 dB, so quiet non-speech clears it
+            # too; there, harmonic structure has to carry the decision on its own. When the input still has
+            # a talker's dynamic range the syllable-swing test is allowed in as well, as before.
+            wide = span >= rise
+            if raised and near_peak and (voiced or (wide and self.mod_db >= talk_mod)):
                 state = "talking"
             elif raised:
-                state = "noise"                # louder than the floor but steady: not a person talking
+                state = "noise"                # raised, steady AND spectrally noise-like: not a caller
             else:
                 state = "quiet"
-            # a steady raise that lasts 2 s (fan, traffic, gain change) is the new floor, not a caller
-            self.noise_run = self.noise_run + 1 if state == "noise" else 0
+            # A steady raise that lasts 2 s (fan, traffic, a gain change) becomes the new floor. Only ever
+            # from unvoiced blocks: letting a voice raise the floor mutes the caller for the rest of the call.
+            self.noise_run = self.noise_run + 1 if (state == "noise" and not voiced) else 0
             if self.noise_run >= 20:
                 recent = float(np.percentile(list(self.levels)[-20:], 10))
                 self.levels.clear()
@@ -510,6 +583,9 @@ class LiveSession:
                 turns.append({"start": round(open_ev["t"], 2), "end": round(ev["t"], 2), "text": open_ev.get("text", "")})
                 open_ev = None
         return turns
+
+    def full_audio(self) -> np.ndarray:
+        return self._buf[:self.n]
 
     def agent_track(self) -> np.ndarray:
         """Channel-1 stand-in for the downloadable WAV: soft noise bursts where the agent spoke."""
@@ -646,7 +722,7 @@ class LiveSession:
                  voiced * 100, self.await_answer)
         if not self.await_answer or self.busy or self.done:
             return
-        x = self.audio()[int(s * 8000):int(e * 8000)]
+        x = self.full_audio()[int(s * 8000):int(e * 8000)]
         # hold the turn while transcribing so the no-answer timer cannot advance the flow underneath us
         self.busy = True
         self.await_answer = False
@@ -693,12 +769,22 @@ class LiveSession:
         await self.say_canned(step["interrupt_text"], "interrupt")
 
     async def analyze(self, final: bool):
-        x = self.audio()
+        # Rolling verdicts look at a bounded trailing window; the closing verdict sees the whole call
+        # (itself capped by MAX_SECONDS). A window of a minute and a half is far more caller speech than
+        # the model needs -- it is fully confident by ~20 s -- and it keeps memory flat however long
+        # someone stays on the line.
+        window = None if final else settings.live_window_s
+        x, t0 = self.audio(window)
+        if final and len(x) > int(settings.max_seconds * 8000):
+            x, t0 = x[-int(settings.max_seconds * 8000):], (self.n / 8000.0) - settings.max_seconds
         if len(x) < 8000:
             return None
         call = call_from_arrays(x, None)
-        segs = self.agent_segments()
-        agent_turns = self.agent_text_turns()
+        span = len(x) / 8000.0
+        shift = lambda a, b: (max(a - t0, 0.0), min(b - t0, span))
+        segs = [shift(a, b) for a, b in self.agent_segments() if b > t0]
+        agent_turns = [{**t, "start": round(max(t["start"] - t0, 0.0), 2), "end": round(min(t["end"] - t0, span), 2)}
+                       for t in self.agent_text_turns() if t["end"] > t0]
         # end of call: the semantic check judges what the caller *said* (repeat-backs, the non-existent product)
         # from the transcript the call already produced; Claude if configured, else Gemini
         from .features.semantic import judge_available
@@ -777,7 +863,7 @@ async def ws_live(ws: WebSocket):
                     res = await sess.analyze(final=True)
                     payload = {"type": "final", "result": res}
                     if res is not None:
-                        payload["wav_b64"] = base64.b64encode(to_wav_bytes(sess.audio(), sess.agent_track())).decode("ascii")
+                        payload["wav_b64"] = base64.b64encode(to_wav_bytes(sess.full_audio(), sess.agent_track())).decode("ascii")
                     await sess.send(payload)
                 elif t == "ping":
                     await sess.send({"type": "pong", "seconds": sess.seconds()})

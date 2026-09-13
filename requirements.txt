@@ -8,6 +8,9 @@ fastapi>=0.110
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9
 websockets>=12
+# Only needed for `run.ps1 -Https` / `HTTPS=1 ./run.sh`: makes the self-signed certificate that lets other
+# devices on the wifi open the live call (browsers refuse the microphone on plain http://).
+cryptography>=42
 httpx>=0.27
 pytest>=8
 

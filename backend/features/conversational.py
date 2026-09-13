@@ -13,6 +13,14 @@ the VAD of both channels only (no transcription), so it costs microseconds.
   conv_pause_*      pauses inside caller turns
   conv_false_start  short false starts followed by a proper turn
   conv_regularity   aggregate regularity index (1 = perfectly regular)
+  conv_consistency  the same idea built only from scale-free measures, so a caller that answers *faster*
+                    than a human (a speech-to-speech model) is still judged on how repeatable it is
+
+On speed versus consistency: the dataset's synthetic callers all ran recognition -> LLM -> speech and took
+two to three seconds, so a model trained on raw latency learns "slow = machine" and then waves through a
+realtime voice agent that answers in 300 ms. The brief says the signal is that machines recover
+*consistently*; the conv_resp_log_std / _mad_norm / _predictability / _entropy_norm features measure exactly
+that, and say nothing about how fast the caller is.
 """
 from __future__ import annotations
 
@@ -105,7 +113,7 @@ def conversational_features(vad_c: Vad, vad_a: Vad | None, duration: float) -> C
     out["conv_overlap_frac_of_agent"] = _safe(both.sum() / max(a_mask[:n].sum(), 1))
 
     # --- response latency after each agent turn -------------------------------------------
-    lat = []
+    lat, lat_agent_dur = [], []
     for i, (s, e) in enumerate(a_turns):
         nxt = a_turns[i + 1][0] if i + 1 < len(a_turns) else duration + 10
         if _active_at(c_mask, e - HOP_S):     # caller already talking when agent stops: overlap, not a response
@@ -114,6 +122,7 @@ def conversational_features(vad_c: Vad, vad_a: Vad | None, duration: float) -> C
         if cand:
             L = cand[0][0] - e
             lat.append(L)
+            lat_agent_dur.append(e - s)       # paired with this latency, for the predictability fit below
             events.append({"type": "response", "t": round(cand[0][0], 2), "latency": round(L, 2)})
     _stats("conv_resp", lat, out)
     if lat:
@@ -185,11 +194,54 @@ def conversational_features(vad_c: Vad, vad_a: Vad | None, duration: float) -> C
         out["conv_dead_caller_fill_frac"] = _safe(len(fills) / dead)
     _stats("conv_dead_fill_latency", fills, out)
 
+    # --- consistency, independent of speed ------------------------------------------------
+    # The brief is explicit: "Humans recover from these instantly and messily. Machines recover
+    # consistently, and consistency is a signal." The first version of this detector measured how *slow*
+    # the caller was instead, because every synthetic caller in the dataset ran a speech-recognition ->
+    # LLM -> speech pipeline and took 2-3 seconds. A speech-to-speech model answers in 300 ms, faster than
+    # any human, and a "slow answers = machine" rule then votes confidently for HUMAN. Everything below is
+    # scale-free on purpose: it asks how *repeatable* the caller's timing is, not how long it takes.
+    lat_a = np.asarray(lat, dtype=np.float64)
+    if lat_a.size >= 3:
+        med = float(np.median(lat_a)) or 1e-6
+        out["conv_resp_range_norm"] = _safe((np.percentile(lat_a, 90) - np.percentile(lat_a, 10)) / abs(med))
+        out["conv_resp_iqr_norm"] = _safe((np.percentile(lat_a, 75) - np.percentile(lat_a, 25)) / abs(med))
+        out["conv_resp_mad_norm"] = _safe(np.median(np.abs(lat_a - med)) / abs(med))
+        # spread of the *log* latency: a person's replies scatter over an order of magnitude (an instant
+        # "sí" and a ten-second think), a scheduler's do not, whatever its mean
+        out["conv_resp_log_std"] = _safe(np.std(np.log(np.clip(lat_a, 0.05, None))))
+        # how much of the variation a straight line through the agent's turn length explains: a pipeline's
+        # latency is a constant plus processing time, so it is nearly predictable; a person's is not
+        dur = np.asarray(lat_agent_dur, dtype=np.float64)
+        if dur.size == lat_a.size and np.std(dur) > 1e-6 and np.std(lat_a) > 1e-9:
+            r = float(np.corrcoef(dur, lat_a)[0, 1])
+            out["conv_resp_predictability"] = _safe(r * r if np.isfinite(r) else np.nan)
+        # entropy of the latency histogram, normalised to [0, 1]: low = the same answer delay every time
+        h, _ = np.histogram(lat_a, bins=min(8, max(3, lat_a.size // 2)))
+        pr = h / max(h.sum(), 1)
+        pr = pr[pr > 0]
+        out["conv_resp_entropy_norm"] = _safe(-(pr * np.log(pr)).sum() / np.log(len(pr)) if len(pr) > 1 else 0.0)
+        # a human sometimes answers before the agent has finished; a turn-taking state machine waits
+        out["conv_resp_fast_frac"] = _safe(np.mean(lat_a < 0.5))
+        out["conv_resp_slow_frac"] = _safe(np.mean(lat_a > 3.0))
+    if len(yields) >= 3:
+        ya = np.asarray(yields, dtype=np.float64)
+        m = float(np.median(ya)) or 1e-6
+        # the brief's own probe: the agent talks over the caller. People stop at wildly different points
+        # (mid-word, after finishing the thought, not at all); a machine yields the same way every time.
+        out["conv_int_yield_range_norm"] = _safe((ya.max() - ya.min()) / abs(m))
+        out["conv_int_yield_log_std"] = _safe(np.std(np.log(np.clip(ya, 0.05, None))))
+
     # --- regularity index -----------------------------------------------------------------
     cvs = [out.get(k) for k in ("conv_resp_cv", "conv_turn_dur_cv", "conv_pause_cv")]
     cvs = [c for c in cvs if c is not None and np.isfinite(c)]
     if cvs:
         out["conv_regularity"] = _safe(1.0 - np.mean(np.clip(cvs, 0, 1.5)) / 1.5)
+    # the same idea over the scale-free measures only, so it survives a fast caller
+    reg = [out.get(k) for k in ("conv_resp_log_std", "conv_resp_mad_norm", "conv_int_yield_log_std")]
+    reg = [c for c in reg if c is not None and np.isfinite(c)]
+    if reg:
+        out["conv_consistency"] = _safe(1.0 - np.mean(np.clip(reg, 0, 1.2)) / 1.2)
     return ConvResult(features=out, events=events, timeline=_timeline(vad_c, vad_a))
 
 

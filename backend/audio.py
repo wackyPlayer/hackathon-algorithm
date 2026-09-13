@@ -92,12 +92,20 @@ def resample(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
 def load_call(data: bytes, target_sr: int = TARGET_SR, max_seconds: float | None = None) -> Call:
     x, sr, fmt = decode_wav_bytes(data)
     n_ch = x.shape[1]
+    # The sample rate comes from the request's own WAV header, so it is attacker-controlled, and
+    # resample_poly's cost scales with target_sr / gcd(sr, target_sr). A header claiming 200 Hz turns a
+    # short clip into a 40x upsample of the whole file. Reject implausible rates and cut the audio to
+    # max_seconds at the INPUT rate, before resampling, so the work is bounded by what we will keep.
+    if not 4000 <= sr <= 192000:
+        raise ValueError(f"implausible sample rate in WAV header: {sr} Hz")
+    if max_seconds is not None:
+        x = x[: int(max_seconds * sr)]
     caller = x[:, 0]
     agent = x[:, 1] if n_ch > 1 else None
     if sr != target_sr:
         caller = resample(caller, sr, target_sr)
         agent = resample(agent, sr, target_sr) if agent is not None else None
-    if max_seconds is not None:
+    if max_seconds is not None:                      # resampling can round a sample over the limit
         n = int(max_seconds * target_sr)
         caller = caller[:n]
         agent = agent[:n] if agent is not None else None

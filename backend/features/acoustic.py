@@ -291,6 +291,21 @@ def rhythm_features(P: np.ndarray, freqs: np.ndarray, vad: Vad) -> dict:
 
 
 def cepstral_features(P: np.ndarray, freqs: np.ndarray, speech: np.ndarray) -> dict:
+    """Cepstral statistics, split into the part that survives a change of channel and the part that does not.
+
+    A transmission path is (near enough) a convolution, and convolution is addition in the cepstral domain.
+    So the *mean* cepstrum of a call is roughly "this speaker" + "this microphone, codec and room": the
+    `_m{i}` features below carry the recording setup as much as the voice, which is how a detector ends up
+    recognising phone lines instead of people. Subtracting the per-call mean (cepstral mean normalisation,
+    the standard trick from speaker recognition) cancels the channel term and leaves how the voice *moves*:
+
+      _m{i}  raw mean          -- speaker + channel; kept, but training can drop it with --drop-feature-prefix
+      _s{i}  spread            -- already immune to the channel offset
+      _d{i}  frame-to-frame change of the normalised coefficient -- articulation speed, channel-free
+
+    The `_d` features are the ones that transfer: a cloned voice played down a phone line and the same clip
+    played into a laptop microphone have very different `_m`, and nearly identical `_d`.
+    """
     out: dict = {}
     if speech.sum() < 20:
         return out
@@ -306,7 +321,15 @@ def cepstral_features(P: np.ndarray, freqs: np.ndarray, speech: np.ndarray) -> d
             out[f"{name}_m{i}"] = _safe(mu[i])
             out[f"{name}_s{i}"] = _safe(sd[i])
         if C.shape[1] > 2:
-            out[f"{name}_delta_std"] = _safe(np.abs(np.diff(C, axis=1)).std(axis=1).mean())
+            Cn = C - mu[:, None]                      # cepstral mean normalisation
+            D = np.diff(Cn, axis=1)
+            out[f"{name}_delta_std"] = _safe(np.abs(D).std(axis=1).mean())
+            dstd = D.std(axis=1)
+            for i in range(nc):
+                out[f"{name}_d{i}"] = _safe(dstd[i])
+            # how much of the coefficient's energy is movement rather than a fixed offset: a vocoder holds
+            # its spectral envelope far steadier between frames than a vocal tract does
+            out[f"{name}_dyn_ratio"] = _safe(float(np.mean(dstd / (sd + EPS))))
     return out
 
 

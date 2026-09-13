@@ -80,15 +80,26 @@ ASPECTS: dict = {
     "turn_taking": {
         "label": "Turn-taking behaviour",
         "weight": 1.3,
+        # Latency magnitude alone cannot carry this aspect. Every synthetic caller in the dataset ran
+        # recognition -> LLM -> speech and answered in 2-3 s, so terms built on "slow = machine" score a
+        # speech-to-speech agent (0.25-0.7 s, faster than a person) as HUMAN: measured, they flagged 14 % of
+        # such callers. The scale-free consistency terms below raise that to 55 % while holding the
+        # false-flag rate on real held-out customers at 4.3 % on full calls and on 60 s clips.
+        # Centres and widths for those terms come from training/recalibrate_heuristics.py, fitted on the
+        # training side of the split only (never the held-out calls) and across full calls and clips.
+        # Dropped: conv_dead_fill_latency_n -- a raw event count that scales with clip length, and it is
+        # emitted as 0.0 even when no silence fill was ever seen, which then voted strongly HUMAN.
         "terms": [
-            ("conv_resp_median", 1.8, 0.3, True, 1.0, "median response latency (s)"),
-            ("conv_resp_min", 1.1, 0.3, True, 1.0, "fastest response (s)"),
-            ("conv_resp_frac_over_2s", 0.35, 0.12, True, 0.8, "responses slower than 2 s"),
+            ("conv_resp_median", 1.8, 0.3, True, 0.8, "median response latency (s)"),
+            ("conv_resp_min", 1.1, 0.3, True, 0.6, "fastest response (s)"),
+            ("conv_resp_frac_over_2s", 0.35, 0.12, True, 0.6, "responses slower than 2 s"),
             ("conv_dead_caller_fill_frac", 0.45, 0.15, True, 0.8, "dead-air windows filled by the caller"),
-            ("conv_dead_fill_latency_n", 2.0, 0.8, True, 0.5, "number of silence fills"),
             ("conv_backchannel_rate_per_agent_min", 1.0, 0.6, False, 0.4, "back-channels per agent minute"),
-            ("conv_int_through_frac", 0.5, 0.2, True, 0.4, "talks through agent interruptions"),
-            ("conv_turn_dur_mean", 4.0, 1.0, True, 0.4, "mean caller turn length (s)"),
+            ("conv_int_through_frac", 0.5, 0.2, True, 0.3, "talks through agent interruptions"),
+            ("conv_turn_dur_mean", 4.0, 1.0, True, 0.3, "mean caller turn length (s)"),
+            ("conv_resp_mad_norm", 0.145, 0.0657, False, 0.7, "scatter of reply delays around its own median"),
+            ("conv_pause_cv", 0.341, 0.0845, False, 0.6, "variability of pauses inside a caller turn"),
+            ("conv_resp_entropy_norm", 0.918, 0.0398, False, 0.5, "spread of the reply-delay histogram"),
         ],
     },
     "semantic_fabrication": {

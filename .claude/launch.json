@@ -3,9 +3,10 @@
   "configurations": [
     {
       "name": "detector",
-      "runtimeExecutable": ".venv/Scripts/python.exe",
-      "runtimeArgs": ["dev_server.py", "--port", "8010"],
-      "port": 8010
+      "runtimeExecutable": "C:/Users/roblo/OneDrive/Desktop/hackathon algorithm/.venv/Scripts/python.exe",
+      "runtimeArgs": ["dev_server.py"],
+      "port": 8010,
+      "autoPort": true
     }
   ]
 }

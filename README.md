@@ -1,330 +1,402 @@
-# Calliope — autenticación de voz con IA (synthetic caller detection for bank phone lines)
+# Calliope — synthetic-caller detection for bank phone lines
 
-HackMTY 2026 · Altur challenge *"Defend the Bank Against Voice Deepfakes"*.
+HackMTY 2026 · Altur, *"Defend the Bank Against Voice Deepfakes"*.
 
-Given a recorded phone conversation (stereo 8 kHz WAV, channel 0 = caller, channel 1 = Altur's agent) the
-system decides whether the caller is a real person or a synthetic voice, exposes the scored `POST /detect`
-endpoint, and ships an analysis dashboard with a live-call mode.
+Given a recorded phone conversation (stereo 8 kHz WAV, channel 0 = caller, channel 1 = Altur's agent), the
+system decides whether the **caller** is a real person or a synthetic voice, and exposes the scored endpoint:
+
+```
+POST /detect     {"audio": "<base64 of the stereo 8 kHz WAV>"}
+  ->  {"is_synthetic": true, "confidence": 0.93}
+```
+
+`confidence` is **p(the caller is synthetic)**, so it is monotone: it ranks calls for tie-breaking, it can be
+scored for calibration directly, and `is_synthetic == (confidence > 0.5)` always holds. (Set
+`CONFIDENCE_SEMANTICS=p_correct` if your harness wants `max(p, 1-p)` instead.)
+
+---
+
+## The short version
+
+The first version of this detector scored **100 % on the provided validation split** and then called a live
+Gemini voice, played into a laptop microphone, **human**.
+
+That gap is the whole story. It had not learned what a synthetic voice sounds like; it had learned what the
+dataset's *recording path* sounds like. In the provided data the human callers arrive full-band to 4000 Hz
+and the synthetic ones roll off at ~3530 Hz, so a single band-limit feature (`ltas_high_ratio_db`) separated
+the classes with AUC 0.967 on its own. A microphone in a room is wideband, so every such cue pointed at
+"human" at once.
+
+We proved it causally rather than guessing: adding **only** room noise and a short reverb tail to the caller
+channel of calls the model was *trained on* — the voice samples otherwise untouched — moved them from
+
+| call | p(synthetic) clean | p(synthetic) + room |
+|---|---|---|
+| call_01c3806808d6 | 0.983 | **0.017** |
+| call_02c249d2f89d | 0.994 | **0.066** |
+| call_0294f969f98b | 0.993 | 0.587 |
+
+while human calls moved by at most +0.014. The voice had not changed at all. Only the room had.
+
+So this round is about making the detector read the **caller** and not the **line**.
+
+---
+
+## What we changed
+
+**1. The channel is now an explicit, randomised variable — applied to both classes.**
+`training/channels.py` models five paths a voice can take: `telephony` (PSTN, 300–3400 Hz, µ-law),
+`mobile` (wider band, codec drift, packet loss), `mic_room` (a loudspeaker into a microphone across a room:
+full band, reverb, 12–30 dB SNR ambient noise, AGC — *the failure case*), `voip_wide`, and `handset` (the
+replay attack: reverberant *and* band-limited). Every training call, human and synthetic alike, is sent down
+a randomly chosen path. Because the channel no longer correlates with the label, no channel cue can be used
+as a shortcut and the model has to find something in the voice.
+
+**2. Cepstral mean normalisation.** A transmission path is a convolution, and convolution is addition in the
+cepstral domain — so the per-call cepstral *mean* is roughly "this speaker" plus "this microphone and codec".
+Those features carried ~33 % of the old model's weight. We now also emit post-CMN dynamics (`lfcc_d*`,
+`mfcc_d*`, `*_dyn_ratio`): how fast the spectral envelope *moves*.
+
+We checked this rather than assuming it, and the obvious test was misleading. Counting how many features
+shift when the channel changes says the deltas shift *more* (32/33 vs 23/33) — but that counts a common-mode
+move, which tells you nothing about whether a classifier can still use them. Training on one channel and
+testing on the other is the test that matters, and there the ordering reverses: the delta block transfers at
+**AUC 0.817** from `mic_room` to `telephony` against **0.553** — near chance — for the raw means, and it wins
+in 19 of 20 paired seeds. Removing the raw means costs about one call out of 438 either way, so both stay in;
+the point is which block is *load-bearing* when the line changes.
+
+**3. Consistency instead of slowness.** The brief is explicit — *"Humans recover from these instantly and
+messily. Machines recover consistently, and consistency is a signal."* The old model measured the wrong half
+of that. Every synthetic caller in the dataset ran recognition → LLM → speech and took 2–3 s to answer, so it
+learned **slow = machine** — and a modern speech-to-speech agent answers in ~300 ms, *faster* than a human,
+which makes those features vote for HUMAN.
+
+How much of the Gemini failure this accounted for we cannot say: the channel effect above is proven
+causally, this one is not, and the two arrived together. What is measured is that it matters. On generated
+callers that answer in 0.25–0.7 s, the old model detected 79 % through a handset and 88 % through a
+microphone; the new one detects 97 % of both. On the interpretable layer the gap is starker still — the
+turn-taking aspect flagged 14 % of such callers and now flags 55 %, at an unchanged false-alarm rate on real
+held-out customers.
+
+The new conversational features are scale-free by construction: `conv_resp_log_std`, `conv_resp_mad_norm`,
+`conv_resp_entropy_norm`, `conv_resp_range_norm`, `conv_int_yield_log_std`, `conv_consistency`, and
+`conv_resp_predictability` — how much of the caller's response delay is explained by a straight line through
+the agent's turn length, because a pipeline's latency is a constant plus processing time and a person's is
+not. None of them ask how *fast* the caller is. The corpus gained a matching `realtime` caller profile
+(answers in 0.25–0.7 s with near-zero spread) so the model is actually trained against that threat.
+
+**4. No more self-grading.** The previously shipped model was refit on train + val and then reported its
+accuracy *on val*. `training/train.py` now carves 20 % of the dataset's training calls into a held-out side
+(grouped, so a call's clips and channel-augmented copies never straddle the split) and `--refit fit` ships
+the model fitted on the training side only — every number below describes the weights that actually ship.
+
+**5. Corpus-construction artifacts are detected and dropped.** Adding self-made synthetic calls creates its
+own trap: our generated calls share a fixed agent recording and a scripted flow, so features like
+"fraction of the call the agent speaks" identify *our generator* rather than a synthetic caller — and those
+were the #1 and #2 weights. `--drop-corpus-artifacts` compares, per feature, how well it separates
+human-from-synthetic within the real dataset against how well it separates real-synthetic from
+corpus-synthetic (same label, different origin) and drops the ones that know the generator better than the
+class. It removed 19 features at no cost in accuracy — and it says so out loud when it has nothing to
+compare against, because a filter that silently does nothing makes an ablation look like a shipped
+configuration when it is not.
+
+One of those artifacts we had built ourselves: the corpus generator originally had machines answer into the
+five seconds of dead air **every** time, against 38 % for its humans, so `conv_dead_caller_fill_frac` sat at
+exactly 1.0 for 98 % of generated machine calls. That is a property of our `if` statement, not of synthetic
+callers. It now fires 80 % of the time, matching the rate the real dataset's bots actually show (~81 %).
+
+---
 
 ## Results
 
-Speaker-disjoint validation split of the Altur dataset (71 calls the model never saw), plus a corpus of
-synthetic callers made with **other TTS engines** (ElevenLabs flash / turbo / multilingual / v3 and Edge neural
-voices, 132 calls, see *Other TTS engines* below) that the previous model mostly missed:
+All numbers are on data the shipped model never saw.
 
-| Input | Accuracy | AUC | Errors |
-|---|---|---|---|
-| Dataset val, full calls (61–273 s) | **100 %** | 1.000 | none |
-| Dataset val, first 60 s | 98.6 % | 1.000 | 0 misses, 1 false alarm |
-| Dataset val, first 30 s | 98.6 % | 1.000 | 0 misses, 1 false alarm (a clip with 5 s of speech) |
-| Other-engine TTS, voices never seen (36 val calls) | **100 % detected** | – | none |
-| Other-engine TTS, *engine* never seen (leave-one-engine-out) | 89–94 % detected | – | 0 false alarms |
+<!--RESULTS-->
 
-Before this round the same detector caught only **45 %** of the other-engine TTS calls (54 % with bot-like
-timing, 35 % with human-like timing): it had learned the dataset's one bot pipeline, not "synthetic voice".
-Adding the TTS corpus (through a randomised telephony-channel simulation, plus channel-augmented copies of
-the dataset's own calls so that the simulated channel cannot become a shortcut) and new per-turn consistency /
-intra-turn pause features fixed that without losing dataset accuracy. Grouped 5-fold cross-validation on the
-training rows (folds never share a caller or a TTS voice): AUC 0.998.
+The shipped model is fitted on 2601 rows and never saw any call below (`--holdout-frac 0.2 --refit fit`).
 
-Latency of `/detect` end-to-end over HTTP on a laptop CPU (16 threads, one worker): ~1.3 s for a full
-2.5-minute call, 0.3 s for a 20 s clip. **30–60 s of audio is enough for the full accuracy**; the live mode
-gives a rolling verdict every 2 s.
+### Held out from training
 
-The deployed `models/detector.joblib` is refit on train + val (dataset and TTS corpus), so `bench/benchmark.py`
-and `bench/eval_corpus.py` on those files reproduce the endpoint contract and latency but are *not*
-generalisation estimates; the table above (from `training/train.py` with val untouched, and the
-leave-one-engine-out runs) is.
+| Test set | calls | accuracy | AUC | errors |
+|---|---:|---:|---:|---|
+| 20 % of the training calls, held out (full calls) | 57 | **100.0 %** | 1.0000 | none |
+| the provided `val` split (full calls) | 71 | **100.0 %** | 1.0000 | none |
+| the `val` split, first 60 s only | 71 | **100.0 %** | 1.0000 | none |
+| the `val` split, first 30 s only | 71 | **97.2 %** | 0.9730 | 1 missed, 1 false alarm |
+| held-out calls re-sent down a different channel | 142 | **97.2 %** | 0.9956 | 4 false alarms |
+| **everything held out, pooled** | 456 | **98.9 %** | 0.9983 | 5 false alarms |
 
-## How it works — three signal families, one calibrated decision
+### By call condition — the robustness that was missing
+
+Same held-out calls, grouped by the path the caller's voice travelled. `original` is the dataset's own recordings; the rest are re-renderings of held-out calls through a channel the model was not fitted on for that call.
+
+| Channel | calls | accuracy | AUC | errors |
+|---|---:|---:|---:|---|
+| replay through a handset | 76 | **100.0 %** | 1.0000 | none |
+| **loudspeaker → room → microphone** | 65 | **93.8 %** | 0.9844 | 4 false alarms |
+| mobile / cellular | 67 | **98.5 %** | 1.0000 | 1 false alarm |
+| original recording | 128 | **100.0 %** | 1.0000 | none |
+| telephony (PSTN, µ-law) | 67 | **100.0 %** | 1.0000 | none |
+| wideband VoIP | 53 | **100.0 %** | 1.0000 | none |
+
+### By caller behaviour
+
+| Caller | calls | accuracy | AUC | errors |
+|---|---:|---:|---:|---|
+| the dataset's own callers | 384 | **98.7 %** | 0.9987 | 5 false alarms |
+| pipeline bot (recognition → LLM → speech, answers in 1.4–3.2 s) | 24 | **100.0 %** | — | none |
+| synthetic voice with human timing (back-channels, false starts) | 24 | **100.0 %** | — | none |
+| **speech-to-speech bot (answers in 0.25–0.7 s, faster than a human)** | 24 | **100.0 %** | — | none |
+
+### The same callers, down five different lines
+
+A paired test: one set of generated synthetic callers, each rendered through every channel, so a difference
+between rows is the transmission path and nothing else. These share voices and scripts with the training
+corpus — they measure **channel** robustness, not unseen voices; for that see the two sections below. The
+*before* column is the model this round replaced.
+
+| Channel | calls | before | after |
+|---|---:|---:|---:|
+| telephony | 99 | 100.0 % | **100.0 %** |
+| mobile | 99 | 100.0 % | **100.0 %** |
+| voip_wide | 99 | 99.0 % | **99.0 %** |
+| mic_room | 99 | 89.9 % | **96.0 %** |
+| handset | 99 | 83.8 % | **97.0 %** |
+
+### An engine we have never heard
+
+The corpus uses two TTS engines. Pulling one out of training entirely — every voice of it — and scoring only
+that engine is the honest estimate of what happens when a fraudster shows up with a generator we have never
+seen. The dataset side is untouched in both arms.
+
+| Engine held out of training | its calls | detected | provided `val` split | held-out dataset calls |
+|---|---:|---:|---:|---:|
+| ElevenLabs (11 voices) | 66 | **92.4 %** | 100 % | 100 % |
+| Edge neural (11 voices) | 198 | **85.9 %** | 100 % | 100 % |
+
+For contrast, a model trained with **no** generated speech at all detects the same ElevenLabs calls at
+56.8 %. Training on one engine buys ~+35 points on a different one — the generalisation is real, and it is
+also clearly not free: 86–92 % is the number to quote, not the 99 % from familiar conditions.
+
+Unseen *voices* of a familiar engine (the corpus holds a third of its voices out of training) are detected at
+**100 %** (72 calls).
+
+### Latency
+
+Measured end to end through `/detect` on real calls, single request, laptop CPU.
+
+| Audio sent | median | p90 | audio per second of compute |
+|---|---:|---:|---:|
+| 5 s | 0.20 s | 0.36 s | 38× |
+| 10 s | 0.36 s | 0.49 s | 43× |
+| **20 s** | **0.73 s** | 0.93 s | 37× |
+| 30 s | 0.99 s | 1.16 s | 40× |
+| 60 s | 1.67 s | 1.97 s | 48× |
+| full call (median 136 s) | 3.26 s | 4.42 s | 51× |
+
+The answer to "how fast can it decide with reasonable confidence" is **about 20 seconds of call**, which
+costs well under a second: below that the caller has usually not said enough, and the endpoint abstains at
+0.5 rather than guessing. 160 responses across those lengths were checked for the contract: every one
+well-formed, zero violations of `is_synthetic == (confidence > 0.5)`, and nothing ever reported at 1.0.
+
+### The live call
+
+Two bugs worth recording, both found by measurement rather than inspection.
+
+*It went deaf on a compressing microphone.* A block counted as speech only once it sat a fixed 8 dB above the
+tracked noise floor. A microphone with automatic gain control squashes an entire call into ~6 dB, so that bar
+is unreachable: on a real call re-rendered through a room-and-microphone channel the session accepted **1 %**
+of blocks and finalised no utterance at all — the detector then scored a caller it had never heard, which is
+a false negative that has nothing to do with the model. The threshold now scales to the dynamic range
+actually present (3 dB floor), and that call goes from 0 % of its speech heard to all of it. Regression test
+in `tests/test_live.py`.
+
+*It used gigabytes.* Every rolling verdict re-analysed the whole call from the start, and the analysis costs
+roughly 175 MB per minute of audio — scipy's STFT builds a complex128 intermediate about fourteen times the
+size of the spectrogram it returns. By minute eight that is **1.4 GB per verdict, every two seconds**, and
+still climbing. Rolling verdicts now read a bounded 90 s trailing window (with the agent's turn times shifted
+to match) and the capture buffer grows by doubling instead of re-concatenating every 100 ms block:
+
+| call length | before | after |
+|---|---:|---:|
+| 1 min | 178 MB | 178 MB |
+| 4 min | 703 MB | **267 MB** |
+| 8 min | 1407 MB | **267 MB** |
+| 10 min | ~1.8 GB | **267 MB** |
+
+The closing verdict still sees the whole call. On the page, the AudioWorklet's blob URL was never revoked
+(one leak per microphone check) and finished agent clips kept their base64 audio; both are released now.
+
+---
+
+## How it works
 
 ```
-WAV ─► decode/resample ─► shared STFT grid (50 ms / 10 ms) ─► VAD on both channels
+stereo WAV ─► decode / resample ─► one STFT grid (50 ms / 10 ms) ─► VAD on both channels
         │
-        ├─ Acoustic (caller channel, ~170 features)      ─┐
-        ├─ Conversational (turn timeline of both channels) ─┼─► 204-dim vector ─► L2 logistic regression
-        └─ Semantic (optional: Whisper + Claude judge)   ─┘        (C = 0.03, class-balanced, Platt-calibrated)
-                                                                    + acoustic-only head (voice texture, shown as a signal)
-                                                                            │
-                        evidence weighting (seconds of caller speech) ◄─────┘
-                                            │
-                              {"is_synthetic": bool, "confidence": p(verdict correct)}
+        ├─ Acoustic (caller channel)        ─┐
+        ├─ Conversational (both timelines)  ─┼─► feature vector ─► L2 logistic regression
+        └─ Semantic (optional, cascaded)    ─┘        │
+                                                      ▼
+                          evidence weighting ──► {"is_synthetic", "confidence"}
 ```
 
-**1. Acoustic** (`backend/features/acoustic.py`) — pure numpy/scipy, no neural net needed:
-long-term spectrum shape (out-of-band energy, roll-off frequency and steepness = the *"sharp cut"*),
-prosody (pitch variability, contour smoothness, jitter, shimmer, harmonics-to-noise), loudness dynamics,
-syllable rate and its variability, modulation spectrum, LFCC/MFCC statistics, noise-floor level /
-stationarity / digital silence, onset-offset ramps and hard cuts, breath events, LPC formants vs. pitch
-(pitch-shift / voice-changer cue), mains hum, and cross-channel cues (acoustic echo of the agent, caller
-channel behaviour while the agent talks). Cues aimed specifically at neural TTS: **per-turn consistency** of
-level, spectral tilt, high-band balance and centroid (an engine renders every utterance alike; a person moves
-the handset and changes effort between turns), the noise floor **inside** a turn versus **between** turns
-(injected TTS carries the engine's own silence inside a turn and the channel floor between turns), the
-frame-to-frame swing of the high band, and the regularity of inter-syllable intervals.
+**Acoustic** (`backend/features/acoustic.py`, pure numpy/scipy): prosody (pitch variability, contour
+smoothness, jitter, shimmer, harmonics-to-noise), syllable rate and its variability, the modulation
+spectrum, LFCC/MFCC statistics with cepstral mean normalisation, breath events, LPC formants against pitch
+(the voice-changer cue), onset/offset ramps, and the long-term spectrum. The channel descriptors are still
+computed — they are genuinely informative about *how* a call arrived, and the dashboard shows them — but
+augmentation means they cannot stand in for the voice.
 
-**2. Conversational** (`backend/features/conversational.py`) — the challenge's own hint: the agent
-interrupts, falls silent and talks over the caller. From the two VAD timelines we measure response latency
-(mean / median / min / spread / fraction over 2 s), how fast the caller yields when interrupted and whether
-it restarts, back-channels ("ajá", "sí") during agent speech, who fills dead air and after how long,
-turn-length statistics, intra-turn pauses and false starts, plus an overall regularity index.
+**Conversational** (`backend/features/conversational.py`): the brief's own hint. The agent interrupts, falls
+silent and talks over the caller; we measure how *repeatably* the caller handles each of those, plus
+back-channels, false starts, who fills dead air, and intra-turn pauses. All from the two VAD timelines, so
+it costs microseconds and no transcription.
 
-**3. Semantic** (`backend/features/semantic.py`) — what the caller actually *says*. Both channels are
-transcribed with faster-whisper (Spanish) and a judge (Claude `claude-opus-5` when the Anthropic SDK and
-credentials exist, otherwise **Gemini** through `GEMINI_API_KEY`, same JSON schema) reads the dialogue: does
-the caller invent an answer when the agent asks about a product that does not exist ("a person says *I don't
-have that*, a language model tends to invent an answer"), does it repeat information back correctly, does the
-wording read like an LLM (complete sentences, no fillers, no self-corrections). Cheap transcript statistics
-(filler rate, denial phrases, formulaic politeness) are computed even without a judge. In the analysis tab it
-is opt-in (CPU transcription costs ~1 s per second of speech; `SEMANTIC_MODE=uncertain` runs it as a cascade
-when the fast model is unsure); in the **live call** the caller is transcribed turn by turn anyway, so the
-judge runs on the finished transcript at "End call" and its probability is fused into the final verdict.
+**Semantic** (`backend/features/semantic.py`, optional): both channels are transcribed with faster-whisper
+and an LLM judges the caller's replies — does it invent an answer when the agent asks about a product that
+does not exist, does it repeat the folio back correctly, does the wording read like a language model. This
+runs as a **cascade**: only when the fast layers are unsure (`SEMANTIC_MODE=uncertain`, 0.30 < p < 0.70), so
+it never costs latency on a confident call.
 
-**Decision.** All features go through a single, heavily regularised logistic regression (chosen against
-gradient boosting by grouped cross-validation; the LR generalises better to unseen callers and is fully
-explainable). A logit-space fusion adds the optional embedding head and the semantic probability. The final
-probability is pulled toward 0.5 when there is less than ~8 s of caller speech (not enough evidence).
+**Decision.** One heavily regularised logistic regression over all of it — chosen over gradient boosting by
+grouped cross-validation, and fully explainable: the dashboard shows the per-group logit contribution behind
+every verdict. The final probability is pulled toward 0.5 when there is less than ~8 s of caller speech, and
+a clip with no usable speech resolves to **human** — with no evidence we do not accuse a customer.
 
-### What the model actually learned (train split, human vs synthetic callers)
-
-| Cue | Human | Synthetic | Why |
-|---|---|---|---|
-| Energy above 3.6 kHz vs voice band | −25 dB | −35 dB | the bot's audio path is band-limited more sharply (roll-off 3.85 kHz vs 3.51 kHz) |
-| Median response latency after the agent stops | 1.2 s | 2.5 s | ASR → LLM → TTS pipeline delay |
-| Fastest response in the call | 0.6 s | 1.7 s | a bot never answers *fast* |
-| Dead-air windows filled by the caller | 14 % | 81 % | timeout-driven turn taking |
-| Noise-floor level spread (p90 − p10) | 7.3 dB | 2.3 dB | injected audio has a stationary/digital floor |
-| Loudness range across phrases | 19 dB | 11 dB | TTS is level-normalised, humans move the handset |
-| Syllable-rate variability (CV) | 0.16 | 0.09 | machine rhythm is regular |
-
-The dashboard shows the per-group logit contribution of every decision ("Why the model decided").
-
-### Other TTS engines: the synthetic-caller corpus
-
-The dataset contains one family of synthetic callers, so a model fit to it alone learns *that* pipeline.
-`training/tts_corpus.py` builds calls with real, current TTS engines and the same agent flow (greeting,
-interrupted question, folio repeat-back, non-existent product probe, 5 s silence, last question, closing):
-
-* **caller voices**: 11 ElevenLabs premade voices (`eleven_flash_v2_5`, `eleven_turbo_v2_5`,
-  `eleven_multilingual_v2`, `eleven_v3`) and 11 Edge neural Spanish voices (free), speaking 23 scenario scripts
-  (8 hand-written, 15 written by Gemini) with random rate / pitch / stability; the agent is a fixed Edge voice;
-* **two timing profiles per set of lines**: `bot` (long, regular response latency, fills the dead air, no
-  back-channels) and `humanlike` (fast variable latency, back-channels, yields to the interruption, false
-  starts) — the hard case where only the voice itself gives the caller away;
-* **randomised telephony channel**: level, spectral tilt, band-limit, G.711 mu-law companding, one of four
-  noise-floor behaviours (digital silence, dither, stationary, drifting microphone floor with bursts) with SNRs
-  matched to the real calls (38–57 dB), optional short reverb;
-* **label-neutral augmentation**: every training call of the dataset also goes through the same channel
-  simulation (`--augment-dataset`), so "simulated channel" cannot become the cue;
-* ~1/3 of the voices per engine are held out as `val` (voice-disjoint); `train.py --exclude-group-prefix
-  elevenlabs:` / `edge:` gives the leave-one-engine-out numbers.
-
-Every synthesised line is cached under `data/tts/cache/`; the ElevenLabs spend is capped with `--el-credits`
-(this corpus cost ~5.5 k characters). `bench/eval_corpus.py` runs the deployed pipeline on any labelled
-directory and reports detection rate, false alarms and the feature groups behind every error, per timing
-profile / engine / model.
+---
 
 ## Threat coverage
 
 | Attack | Where it shows up | Status |
 |---|---|---|
-| Cloned / TTS voice | acoustic texture, prosody, band shape, breathing | primary target, trained |
-| Autonomous LLM caller (ASR→LLM→TTS) | response latency, dead-air filling, no back-channels, invented answers | primary target, trained (this is what the dataset's synthetic callers are) |
-| Digital injection (no microphone) | digital silence, stationary floor, no channel behaviour while agent speaks, out-of-band energy | features present, trained |
-| Replay through a handset | reverberant decay tails + loudspeaker ripples/hum **combined with** synthetic-voice cues | heuristic attack profile only (no labelled replay data in the set) |
-| Voice changer / pitch shift | pitch-vs-formant mismatch, vocoder texture | heuristic attack profile only |
-| A different human who sounds similar | needs an enrolled voiceprint of the real customer | **out of scope of `/detect`** (the challenge labels such a caller as human); add speaker verification against the account's enrolled embedding as a next step |
+| Cloned / TTS voice | acoustic texture, prosody, cepstral dynamics, breathing | trained, 2 engines + 23 voices |
+| Pipeline caller (ASR→LLM→TTS) | slow *and regular* turn taking, dead-air filling, no back-channels | trained (the dataset's own bots) |
+| **Realtime speech-to-speech caller** | latency consistency, no false starts, no back-channels, invented answers | trained via the `realtime` profile |
+| **Synthetic voice through a microphone** | voice-intrinsic cues only; channel cues neutralised by augmentation | trained via `mic_room` |
+| Replay through a handset | reverberant decay + band-limiting together with synthetic-voice cues | trained via `handset` |
+| Digital injection (no microphone) | digital silence, stationary floor, no channel behaviour while the agent talks | features present, trained |
+| A different human who sounds similar | needs an enrolled voiceprint of the real customer | **out of scope** of `/detect` — add speaker verification against the account's enrolled embedding |
 
-`POST /analyze` returns an *attack profile*: how the synthetic probability splits across these attack
-types, plus ten interpretable aspect ratings (0 = human-like, 100 = synthetic-like) with the cues behind them.
+`POST /analyze` returns an *attack profile*: how the synthetic probability splits across these, plus ten
+interpretable aspect ratings with the measurements behind them.
+
+---
 
 ## API
 
 ```
-POST /detect            scored endpoint
-  body: {"audio": "<base64 of the stereo 8 kHz WAV>"}
-        any key containing audio/wav/clip/data/file/b64 is accepted, nested JSON too,
-        as are raw WAV bytes, a bare base64 body, a data: URI and multipart uploads
+POST /detect            the scored endpoint
+  body: {"audio": "<base64 stereo 8 kHz WAV>"}   (any key containing audio/wav/clip/data/file/b64 works,
+                                                  as do raw WAV bytes, a bare base64 body and multipart)
   200:  {"is_synthetic": true, "confidence": 0.93}
-        confidence = probability that the returned verdict is correct (0.5 … 1.0)
-  400:  audio could not be decoded (a pipeline failure still returns 200 with confidence 0.5)
+  400:  the audio could not be decoded
 
-POST /analyze[?semantic=1&ui=1]   everything: p_synthetic, aspects, attack_profile, events, timeline,
-                                  features, contributions, spectrogram, transcript + judge (if enabled)
-POST /analyze?sample=<name>.wav   analyse a file from SAMPLES_DIR (dashboard dropdown)
+POST /analyze[?semantic=1&ui=1]   everything: p_synthetic, aspects, attack profile, events, timeline,
+                                  features, contributions, spectrogram, transcript + judge
+POST /analyze?sample=<name>.wav   analyse a file from SAMPLES_DIR (the dashboard dropdown)
 GET  /health                      model, metrics, optional layers, uptime
-POST /miccheck[?ns=1&agc=1&sr=..] microphone quality report for a short PCM/WAV sample (quality, warnings, metrics)
-WS   /ws/live                     live call: binary int16 8 kHz PCM frames in, rolling verdict out
+GET  /share                       which links work, and whether each one can run the live call
+POST /miccheck                    microphone quality report for a short PCM sample
+WS   /ws/live                     live call: int16 8 kHz PCM in, rolling verdict out
 GET  /                            dashboard
 ```
 
-Things to confirm with the Altur engineers on site (the brief does not specify them): the JSON key that
-carries the base64 clip (any reasonable key works, see above) and whether `confidence` should be
-*p(verdict correct)* (what we return) or *p(synthetic)*; switch with one line in `backend/main.py` if needed.
+CORS is open on every route, and no input shape returns a 500 — malformed audio is a 400 and an internal
+failure is a neutral 200, so a benchmark harness never stalls on us.
 
 ## Run
 
 ```powershell
-# Windows (creates .venv and installs requirements on first run)
-.\run.ps1                                    # http://localhost:8000
-.\run.ps1 -Port 8010 -Workers 4 -Samples C:\path\to\audio
-# or, for the dashboard with the dataset dropdown:
-.venv\Scripts\python.exe dev_server.py --port 8010
+.\run.ps1                                     # http://localhost:8000
+.\run.ps1 -Port 8010 -Workers 4               # more throughput for the benchmark
+.\run.ps1 -Port 8010 -Https                   # https://<LAN ip>:8010 — needed for other devices' microphones
 ```
 
 ```bash
 ./run.sh                                      # Linux / macOS
-PORT=8010 WORKERS=4 SEMANTIC_MODE=uncertain ANTHROPIC_API_KEY=sk-ant-... ./run.sh
+PORT=8010 WORKERS=4 ./run.sh
+HTTPS=1 PORT=8010 ./run.sh
 ```
 
-Environment (see `.env.example`; a `.env` file next to `README.md` is loaded automatically): `MODEL_PATH`,
-`SEMANTIC_MODE=off|uncertain|always`, `WHISPER_MODEL`, `ANTHROPIC_API_KEY` (judge; Gemini is used otherwise),
-`ENABLE_EMBEDDINGS`, `SAMPLES_DIR`, `DECISION_THRESHOLD`, `MAX_SECONDS`; live agent: `GEMINI_API_KEY`,
-`GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL`,
-`LIVE_WHISPER_MODEL`, `LIVE_ANSWER_TIMEOUT_S`, `LIVE_TALK_MOD_DB`, `LIVE_PEAK_MARGIN_DB`, `LIVE_ESCALATE_P`.
+Tests: `.venv\Scripts\python.exe -m pytest -q`.
 
-Tests: `.venv\Scripts\python.exe -m pytest -q` (14 end-to-end API tests on generated clips, no dataset needed).
-
-Judge-style benchmark against a running server:
+Benchmark against a running server:
 
 ```bash
 python -m bench.benchmark --url http://127.0.0.1:8000/detect --audio audio/ --manifest manifest.csv --split val
-python -m bench.benchmark ... --clip 30          # send only the first 30 s of every call
-python -m bench.benchmark ... --concurrency 4    # parallel requests (run the server with --workers 4)
+python -m bench.benchmark ... --clip 30            # only the first 30 s of every call
+python -m bench.benchmark ... --concurrency 4      # parallel (run the server with --workers 4)
 ```
 
-Use `127.0.0.1`, not `localhost`, for local clients on Windows: Python resolves `localhost` to IPv6 first
-and the fallback adds ~2 s per request that has nothing to do with the detector.
+Use `127.0.0.1`, not `localhost`, for Python clients on Windows: it resolves to IPv6 first and the fallback
+adds ~2 s per request that has nothing to do with the detector.
 
-## Dashboard
+## Sharing it with other people
 
-* **Analyze recording** — drop a WAV (or pick a dataset call). The verdict and its confidence dominate the
-  page; under the probability bar the *Human* / *Synthetic* labels are ringed green / red until the verdict is
-  known, then the losing one turns gray. Below them the **three security checks of the brief** — *Voice*,
-  *Conversation* (how the caller handles the agent interrupting, falling silent and talking over them: people
-  recover instantly and messily, machines consistently) and *Semantics* (what the caller says when asked to
-  repeat information or about things that do not exist) — each with its score, the strongest cue behind it and
-  what it measures; *All indicators* expands the ten underlying indicators (0 = human-like, 100 =
-  synthetic-like) and each opens to its measurements. Then the semantic transcript and judgement (when run),
-  the spectrogram with both speaker lanes, response-latency labels, interruption / silence-fill / back-channel
-  markers, breath marks and pitch track; attack profile, model signals, feature contributions and the raw JSON
-  are collapsed sections. Batch mode runs many files through `/detect` and tabulates verdicts and latency.
-* **Live call with the agent** — you are the caller; the bank agent "Marina" is generated live on the server
-  (`backend/live_agent.py` + the `/ws/live` session in `backend/main.py`):
-  **Gemini** writes every line from what you just said (`GEMINI_API_KEY`, default model `gemini-3.1-flash-lite`,
-  ~1.3 s per line; falls back to `gemini-3.6-flash` with minimal thinking, then to canned Spanish lines),
-  **ElevenLabs** speaks it (`ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID`; without a key the browser's Spanish
-  speech synthesis is used) and **faster-whisper** (`LIVE_WHISPER_MODEL=base`, pre-loaded at start-up) hears
-  you. The flow is the same as Altur's agent: greeting, a question the agent deliberately interrupts after
-  2.5 s of your speech, a folio you repeat back, a probe about an insurance product that does not exist, a
-  5-second silence, a last question the agent talks over, a closing. End-of-turn detection, the interruption and the no-answer
-  timeout (9 s) run server-side on the 8 kHz stream; the browser only captures the microphone and plays the
-  agent's audio, reporting when it starts and stops so the turn timeline is exact. The verdict, aspects and
-  events update every 2 s; "End call" returns the full report, the transcript and the recorded WAV.
-  **Hearing the caller.** The noise floor is the 10th percentile of the last 15 s of 100 ms block levels
-  (seeded from the microphone check), never a fixed level: a −40 dBFS room used to read as continuous speech,
-  so no turn ever ended and the agent never answered. A block above the floor is *talking* only if the level
-  swings the way speech does (p90 − p10 over the last 0.8 s above 3 dB, `LIVE_TALK_MOD_DB`); a raised but
-  steady level is *background noise* (a fan, traffic, a gain step): it cannot open a turn or keep one from
-  ending, and after 2 s it becomes the new floor. The "hearing:" line under the captions shows which of the
-  three the server currently takes the input for, with level, swing and floor. Turns are capped at 20 s,
-  caller and agent actions run under one lock (an answer is queued, never dropped), the browser guards the
-  agent's end-of-audio events with watchdogs, and speech the transcriber cannot read gets a "¿me lo puede
-  repetir?" instead of silence. Captions show the agent's current line and your last transcription.
-  **A distrustful agent.** Marina's prompt tells her to distrust the caller (a possible ASR → LLM → TTS bot),
-  never to confirm products or data the caller claims, and gives her tactics that trip up a language model
-  (false premise, reversed folio, immediate-environment detail, short-answer instructions, sequence tasks,
-  abrupt topic changes). Every turn she receives the detector's reading: the **call average** of the rolling
-  synthetic score (not the latest reading), the latest reading, evidence and the strongest cues, never
-  revealed to the caller. Up to 50 % she follows the script; 50–70 % adds a light check; above 70 %
-  (`LIVE_ESCALATE_P`) an extra challenge step is inserted and the remaining questions are asked at the
-  "alto" level (harder, more concrete, re-asked when the answer is generic). The live panel shows the call
-  average and the agent's level.
-* **Microphone check** — *Test microphone* (and, automatically, the first *Start call*) records 2 s of silence
-  and a spoken sentence, sends it to `POST /miccheck` and grades the input **good / fair / poor** with plain
-  warnings and the risk they carry: digital silence or a perfectly constant floor from a noise gate, browser
-  noise suppression or automatic gain control, clipping and narrow-band (Bluetooth) input all make a real voice
-  look like a synthetic pipeline (*possible false positive*); a very noisy line or mains hum masks the cues
-  (*possible false negative* / unreliable verdict). The report is computed from the same features the detector
-  uses, so it describes what the model will actually see.
-* **Look** — minimal: the Calliope logo palette (shield blue `#2f6be4` on the light gray ground, dark gray
-  text, white cards), the *Switzer* typeface (Fontshare, bundled in `frontend/fonts/`) for everything, thin
-  borders and rounded cards, secondary information in smaller gray text. A **dark mode** toggle sits in the
-  header (☾ / ☀, remembered in the browser; the system preference is the default). The spectrogram maps a
-  fixed 55 dB window below the loudest bins (not silence-floor-to-peak), which keeps harmonics readable
-  instead of saturating speech.
+The dashboard and the API work over plain HTTP on the LAN. **The live call does not**, and this is the
+usual reason sharing appears broken: browsers only hand out a microphone in a *secure context*, meaning
+`https://` or `localhost`. On `http://10.0.0.5:8010` the microphone API is simply absent.
 
-## Sharing the dashboard and API with other people
+Two ways to get a working link, in order of reliability at a venue:
 
 ```powershell
-.\run.ps1 -Port 8010          # host: start the server (or python dev_server.py)
-.\share.ps1 -Port 8010        # host: public HTTPS link via a Cloudflare quick tunnel (installs cloudflared with winget)
+.\run.ps1 -Port 8010 -Https     # self-signed TLS; each device accepts the warning once, then the mic works
+.\share.ps1 -Port 8010          # public HTTPS tunnel (Cloudflare) — use this when the wifi blocks
+                                # device-to-device traffic, which most campus and guest networks do
 ```
 
-`share.ps1` / `share.sh` print a `https://….trycloudflare.com` link and write it to `share_url.txt`; the
-**Share link** button in the header then shows and copies it (`GET /share` also lists the LAN address). The
-public link exposes everything a non-host user needs: the dashboard and its static files, `POST /detect`,
-`POST /analyze`, `GET /samples`, the `/ws/live` WebSocket and `GET /health`. CORS is open on every route and
-`HEAD /` is answered, so external tools and uptime checks work too. HTTPS matters: browsers only allow the
-microphone on `https://` or `localhost`, so the live call for other people needs the tunnel link, while the
-analysis endpoints also work over the plain LAN address.
+`/share` reports which URLs exist and whether each can run the live call, and the dashboard says so up front
+instead of failing silently when it is loaded over plain HTTP. The certificate is generated by
+`backend/tls.py` with every LAN address of the machine in its SAN, so one certificate covers every device.
 
 ## Training
 
 ```bash
-# 1. synthetic-caller corpus with other TTS engines (ELEVENLABS_API_KEY in .env; Edge voices need only pip install edge-tts)
-python -m training.tts_corpus --out data/tts_corpus --el-credits 5500 --el-voices 12 --scenarios-per-voice 1 --augment-dataset
-# 2. features for the dataset (full calls + 30 s / 60 s prefixes) and the corpus
-python -m training.build_features --audio audio/ --manifest manifest.csv --out data/features.csv --clip 30 --clip 60 --extra data/tts_corpus data/tts_corpus/manifest.csv
-# 3. train (logistic regression, acoustic head kept as a displayed signal); prints val metrics per source
-python -m training.train --features data/features.csv --out models/detector.joblib --acoustic-head --fusion none --only-lr --force lr_C0.03
-python -m training.train ... --exclude-group-prefix elevenlabs:     # leave-one-engine-out estimate
-# 4. behaviour check of the deployed pipeline on any labelled directory
-python -m bench.eval_corpus --audio data/tts_corpus --manifest data/tts_corpus/manifest.csv --by profile engine
-# optional SSL embedding head (needs torch + transformers): add --embeddings to build_features and train
+# 1. synthetic callers from other engines + channel-augmented copies of the dataset (both classes)
+python -m training.tts_corpus --out data/corpus_v3 --el-credits 0 \
+    --profiles bot,realtime,humanlike --augment-dataset --augment-copies 2 --augment-val
+
+# 2. one feature table (the same code the server runs, so there is no train/serve skew)
+python -m training.build_features --audio audio/ --manifest manifest.csv \
+    --extra data/corpus_v3 data/corpus_v3/manifest.csv --out data/features_v3.csv --clip 30 --clip 60
+
+# 3. train: 20 % of the training calls held out, shipped weights fitted only on the rest
+python -m training.train --features data/features_v3.csv --out models/detector.joblib \
+    --only-lr --holdout-frac 0.2 --refit fit --drop-corpus-artifacts
 ```
 
-`build_features` extracts the same features the server uses (no train/serve skew) for every call and for
-30 s / 60 s prefixes of it, so the model also sees short excerpts; `--extra` adds labelled corpora whose
-manifest carries a `group` (cross-validation group, e.g. `engine:voice`) and a `source` column. `train`
-selects the model by grouped cross-validation (`--only-lr` skips the slow gradient-boosting candidates, which
-tied the logistic regression on val but cannot be explained), evaluates on the untouched speaker-disjoint
-`val` split per source, decides whether Platt calibration helps on unseen speakers (with the TTS corpus it
-does, and it is deployed), optionally trains the acoustic-only head and prints val metrics for the `max` /
-`mean` / `stack` fusion rules (none beat the main model, so `--fusion none` is deployed and the head is only
-shown as a signal), refits on train + val and writes `models/detector.joblib` plus `models/train_report.json`.
-Count-like features that scale with clip length are excluded so the model does not learn "long call = human".
+Useful flags: `--exclude-group-prefix elevenlabs:` holds an entire TTS engine out of training and reports it
+separately (the leave-one-engine-out number); `--drop-feature-prefix floor_` removes a feature family to
+measure what the model is leaning on; `--refit all` trades the honest report for a little more training data.
 
-## Judge-day checklist
+## Dashboard
 
-1. `.\run.ps1 -Workers 4` (16 threads on this laptop analyse ~4 calls/s); the first request after start is
-   already warm.
-2. Expose the port (`cloudflared tunnel --url http://localhost:8000` or ngrok) and test with
-   `bench/benchmark.py --url https://<tunnel>/detect --dir some_clips/`.
-3. Keep `SEMANTIC_MODE=off` unless a GPU is available (Whisper on CPU adds ~1 s per second of speech).
-4. Confirm the request JSON key and the confidence semantics with the Altur engineers (see API).
-5. Show the dashboard on a val call and on a live call; open "Why the model decided".
-
-## Layout
-
-```
-backend/            FastAPI app (main.py), audio decoding, VAD, features/, scoring/ (heuristics, model, pipeline)
-frontend/           dashboard (index.html, app.js, style.css) — served by the backend
-training/           build_features.py, train.py
-bench/              benchmark.py (judge-style client), make_clips.py (synthetic smoke-test clips)
-tests/              pytest end-to-end API tests
-models/             detector.joblib + train_report.json
-```
+* **Analyze recording** — drop a WAV or pick a dataset call: verdict, confidence, the three checks from the
+  brief (voice / conversation / semantics), ten aspect ratings with their measurements, attack profile,
+  spectrogram with both speaker lanes, response-latency labels, interruption and silence-fill markers,
+  breath marks, pitch track, model contributions, raw JSON. Batch mode runs many files through `/detect`.
+* **Live call with the agent** — you are the caller; the bank agent "Marina" is generated on the server
+  (Gemini writes each line, ElevenLabs speaks it, faster-whisper hears you) and runs the brief's flow:
+  greeting, a question she interrupts, a folio to repeat back, a probe about an insurance product that does
+  not exist, a 5 s silence, a closing. The verdict updates every 2 s.
 
 ## Honest limitations
 
-* The dataset contains one agent flow and one family of synthetic callers; the hidden set uses unseen
-  callers and voices, which is what the speaker-disjoint validation estimates. Robustness to *other* TTS
-  engines is estimated with the ElevenLabs / Edge corpus (leave-one-engine-out 89–94 % detection); the corpus
-  goes through a simulated telephony channel, not a real carrier, and the caller scripts are read by TTS rather
-  than produced by an LLM, so an unseen engine on a real line may still land below those numbers.
-* The microphone check grades the input path, not the person: it can only warn that a verdict may be biased.
-* VAD is energy-based (fast, codec-agnostic); the provided `turns/*.json` were used only to sanity-check it.
-* The replay and voice-changer scores are heuristic (no labelled examples); the similar-human case needs
-  speaker verification against an enrolled voiceprint, which the `/detect` contract cannot express.
-* The synthetic smoke-test clips in `bench/make_clips.py` are caricatures for CI only, never training data.
+* The `mic_room` / `handset` channels are **simulated**, not recorded. They model the physics (room impulse
+  response, ambient noise at realistic SNR, loudspeaker colouration, AGC, the 48 kHz → 8 kHz anti-alias
+  edge), and the microphone failure they were built to reproduce is real and was measured — but a corpus of
+  genuine re-recorded calls would be better evidence, and is the first thing we would collect next.
+* The synthetic corpus uses two TTS engines (ElevenLabs, Edge). Leave-one-engine-out measures what happens on
+  an engine never seen, but two is a small number of engines — and both are conventional TTS. No
+  speech-to-speech model's actual audio is in the corpus, only its *timing*: the `realtime` profile is an
+  ElevenLabs or Edge voice on a fast, regular schedule, not a recording of Gemini Live.
+* Every error the shipped model makes on held-out data is a **false alarm**, not a miss (5 of 456), and four
+  of the five are human callers re-rendered through the simulated microphone channel. That is the safer
+  direction to fail in, but it is the expensive one for a bank, and it is what we would attack next.
+* The held-out dataset slice is 57 calls and the provided `val` split is 71, so several cells above move by
+  1.4–1.8 points per call. Read "100 %" as "no errors in 57 calls", not as a rate.
+* The semantic layer needs an API key and adds seconds, so it is cascaded and off by default. Every number
+  above is from the acoustic + conversational layers alone.
+* Speaker *verification* (is this the customer this account belongs to?) is out of scope here and is the
+  natural next layer: a synthetic voice and an impostor human are different problems.

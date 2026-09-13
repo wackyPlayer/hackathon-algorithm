@@ -1,32 +1,64 @@
-/* Calliope dashboard - vanilla JS, no build step. */
+/* dashboard script. plain javascript, no framework. */
 "use strict";
 
-const $ = (s, r = document) => r.querySelector(s);
-const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
-const fmt = (x, d = 2) => (x === null || x === undefined || Number.isNaN(x)) ? "—" : Number(x).toFixed(d);
-const pct = (x) => (x === null || x === undefined) ? "—" : Math.round(x * 100) + "%";
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-
-// ------------------------------------------------------------------ theme (light / dark)
-function currentTheme() {
-  const t = document.documentElement.getAttribute("data-theme");
-  if (t) return t;
-  return window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+// little helpers I use everywhere
+function $(sel, root) {
+  if (!root) root = document;
+  return root.querySelector(sel);
 }
-function applyTheme(t) {
-  document.documentElement.setAttribute("data-theme", t);
-  try { localStorage.setItem("theme", t); } catch (e) { /* storage blocked */ }
-  $("#theme-btn").textContent = t === "dark" ? "☀" : "☾";
-  $("#theme-btn").title = t === "dark" ? "Switch to light mode" : "Switch to dark mode";
+function $$(sel, root) {
+  if (!root) root = document;
+  return Array.prototype.slice.call(root.querySelectorAll(sel));
 }
-$("#theme-btn").textContent = currentTheme() === "dark" ? "☀" : "☾";
-$("#theme-btn").addEventListener("click", () => applyTheme(currentTheme() === "dark" ? "light" : "dark"));
+function fmt(x, d) {
+  if (d === undefined) d = 2;
+  if (x === null || x === undefined || Number.isNaN(x)) return "-";
+  return Number(x).toFixed(d);
+}
+function pct(x) {
+  if (x === null || x === undefined) return "-";
+  return Math.round(x * 100) + "%";
+}
+function esc(s) {
+  if (s === null || s === undefined) s = "";
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
-// ------------------------------------------------------------------ tabs + health + share
-$$(".tab").forEach(b => b.addEventListener("click", () => {
-  $$(".tab").forEach(t => t.classList.toggle("active", t === b));
-  $$(".tabpane").forEach(p => p.classList.toggle("active", p.id === "tab-" + b.dataset.tab));
-}));
+// ------------------------------------------------------------------ tabs
+var tabs = $$(".tab");
+for (var i = 0; i < tabs.length; i++) {
+  tabs[i].addEventListener("click", function () {
+    var clicked = this;
+    $$(".tab").forEach(function (t) { t.classList.toggle("active", t === clicked); });
+    $$(".tabpane").forEach(function (p) { p.classList.toggle("active", p.id === "tab-" + clicked.dataset.tab); });
+  });
+}
+
+// ------------------------------------------------------------------ microphone needs https
+// Browsers only give a page the microphone when it is "secure": https:// or localhost. Opening the LAN
+// address over plain http shows the dashboard fine but the live call can never start, which is confusing,
+// so say it up front and say how to fix it.
+function checkSecureContext() {
+  if (window.isSecureContext) return;
+  var box = $("#mic-warning");
+  box.classList.remove("hidden");
+  box.innerHTML =
+    "<b>The live call will not work on this address.</b>" +
+    "<div class='small' style='margin-top:6px'>This page is on <code>" + esc(location.origin) + "</code>," +
+    " and browsers only allow the microphone over <code>https://</code> or on <code>localhost</code>." +
+    " Everything else (uploading a recording, the API) works normally here.</div>" +
+    "<div class='small' style='margin-top:6px'>To fix it on the machine running the server:" +
+    "<br>Windows: <code>.\\run.ps1 -Port " + (location.port || 8000) + " -Https</code>" +
+    "<br>Mac / Linux: <code>HTTPS=1 PORT=" + (location.port || 8000) + " ./run.sh</code>" +
+    "<br>Then open the <code>https://</code> link it prints and accept the certificate warning once." +
+    " If the wifi blocks device-to-device traffic, run <code>share.ps1</code> / <code>share.sh</code> for a public link instead.</div>";
+}
+checkSecureContext();
 
 let HEALTH = null;
 async function loadHealth() {
@@ -49,21 +81,51 @@ setInterval(loadHealth, 15000);
 
 async function loadShare() {
   try {
-    const j = await (await fetch("/share")).json();
+    const r = await fetch("/share");
+    const j = await r.json();
     const btn = $("#share-btn");
-    const url = j.public_url || (j.lan_urls && j.lan_urls[0]) || "";
+    const url = j.recommended_url || j.public_url || (j.lan_urls && j.lan_urls[0]) || "";
     if (!url) return;
     btn.classList.remove("hidden");
-    btn.title = j.public_url ? "public HTTPS link (works for anyone, including the live call)" : "LAN link (same network; the live call needs HTTPS or localhost for the microphone)";
-    btn.onclick = async () => {
-      const lines = [];
-      if (j.public_url) lines.push("Public: " + j.public_url);
-      (j.lan_urls || []).forEach(u => lines.push("LAN: " + u));
-      try { await navigator.clipboard.writeText(url); btn.textContent = "Copied!"; setTimeout(() => btn.textContent = "Share link", 1500); } catch (e) { /* clipboard blocked */ }
+    // This is about the link other people would open, not about this page: localhost is always allowed
+    // the microphone, the LAN address it hands out is not.
+    btn.title = j.mic_ok
+      ? "the shared link can run the live call too"
+      : "the shared link works for the dashboard and the API, but not the live call (needs https)";
+
+    btn.onclick = async function () {
+      let html = "";
+      if (j.public_url) {
+        html += "<div><b>Public link:</b> <code>" + esc(j.public_url) + "</code></div>";
+      }
+      for (const u of (j.lan_urls || [])) {
+        html += "<div><b>Same wifi:</b> <code>" + esc(u) + "</code></div>";
+      }
+      html += "<div class='small' style='margin-top:6px'>" + esc(j.recommended_note || "") + "</div>";
+
+      if (!j.mic_ok) {
+        // this is the usual "sharing doesn't work" case, so spell out the fix
+        html += "<div class='small' style='margin-top:6px'>Other devices can open the dashboard and call the API" +
+          " on these links, but <b>not</b> the live call: browsers only give out the microphone over https." +
+          "<br>Restart the server with <code>" + esc(j.how_to_enable_https.windows) + "</code> (Windows) or <code>" +
+          esc(j.how_to_enable_https.linux_macos) + "</code>, then share the https link and accept the" +
+          " certificate warning once on each device." +
+          "<br>On wifi that blocks device-to-device traffic (most campus and guest networks), run <code>share.ps1</code>" +
+          " or <code>share.sh</code> instead - that gives a real public https link.</div>";
+      }
       $("#share-box").classList.remove("hidden");
-      $("#share-box").innerHTML = lines.map(l => `<div>${esc(l)}</div>`).join("") + (j.public_url ? "" : `<div class="muted small">Run <code>share.ps1</code> (or <code>share.sh</code>) on the host to get a public HTTPS link.</div>`);
+      $("#share-box").innerHTML = html;
+      try {
+        await navigator.clipboard.writeText(url);
+        btn.textContent = "Copied!";
+        setTimeout(function () { btn.textContent = "Share link"; }, 1500);
+      } catch (e) {
+        // clipboard is blocked without https as well, the link is on screen anyway
+      }
     };
-  } catch (e) { /* no share info */ }
+  } catch (e) {
+    // no share info, not important
+  }
 }
 loadShare();
 setInterval(loadShare, 20000);
@@ -331,7 +393,7 @@ function drawSpectrogram(canvas, res) {
   const dur = res.duration_seconds || 1;
   const specH = 190, laneY = specH + 8, laneH = 18, evY = laneY + laneH * 2 + 10;
   const X = t => (t / dur) * W;
-  const font = "12px Switzer, sans-serif";
+  var font = "12px Arial, sans-serif";
   if (sp && sp.data) {
     const bytes = Uint8Array.from(atob(sp.data), c => c.charCodeAt(0));
     const off = document.createElement("canvas"); off.width = sp.cols; off.height = sp.rows;
@@ -406,7 +468,11 @@ async function openMic() {
   await ctx.resume();
   const src = ctx.createMediaStreamSource(stream);
   const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: "application/javascript" }));
-  await ctx.audioWorklet.addModule(url);
+  try {
+    await ctx.audioWorklet.addModule(url);
+  } finally {
+    URL.revokeObjectURL(url);   // the module is compiled by now; without this every call leaks the blob
+  }
   const node = new AudioWorkletNode(ctx, "pcm-capture");
   src.connect(node);
   const track = stream.getAudioTracks()[0];
@@ -564,7 +630,8 @@ class LiveCall {
         let ended = false; const endOnce = () => { if (!ended) { ended = true; clearTimeout(guard); end(); } };
         let guard = setTimeout(endOnce, (Math.max(3, text.length / 12) + 3) * 1000);
         a.onloadedmetadata = () => { if (isFinite(a.duration) && a.duration > 0) { clearTimeout(guard); guard = setTimeout(endOnce, (a.duration + 1.5) * 1000); } };
-        a.onplaying = start; a.onended = endOnce;
+        a.onplaying = start;
+        a.onended = () => { endOnce(); a.src = ""; };   // release the base64 audio once it has played
         a.onerror = () => { if (ended) return; ended = true; clearTimeout(guard); this.log("(audio playback failed, using browser voice)", "note", "note"); this.speak(text, kind, res); };
         a.play().catch(() => { if (ended) return; ended = true; clearTimeout(guard); this.log("(autoplay blocked, using browser voice)", "note", "note"); this.speak(text, kind, res); });
         this._audio = a;

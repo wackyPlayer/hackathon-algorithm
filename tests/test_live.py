@@ -105,8 +105,11 @@ def test_steady_noise_is_not_a_turn(offline_agent):
         sent = _stream(ws, noise(8000), sent)
         sent = _stream(ws, loud(8000 * 3), sent)                       # 3 s of steady loud noise
         sent = _stream(ws, noise(8000 * 2), sent)
-        vad = _recv(ws, "vad", where=lambda m: m["state"] == "noise")
-        assert vad["speaking"] is False and vad["mod_db"] < 3
+        # Look at a frame from *inside* the steady stretch, not the step itself: at the transition the
+        # 0.8 s window straddles both levels, so its p90-p10 is the size of the step (~14 dB) and says
+        # nothing about whether the noise is steady.
+        vad = _recv(ws, "vad", where=lambda m: m["state"] == "noise" and m["mod_db"] < 3)
+        assert vad["speaking"] is False
         # now real speech on top of the quieter floor is still heard
         sp = _speech(rng, 2.5, -24)
         sent = _stream(ws, sp + noise(len(sp)), sent)
@@ -167,3 +170,32 @@ def test_call_average_escalates_the_agent(offline_agent):
     line = brain.line(sess.step, "siete cuatro dos nueve uno", ctx)
     assert "orden inverso" in line and "Nivel de exigencia: alto" in brain.history[-2]["parts"][0]["text"]
     assert render_context(None).endswith("normal (desconfianza habitual).")
+
+
+def test_agc_compressed_microphone_is_still_heard(offline_agent):
+    """A microphone with automatic gain control squashes the whole call into a few dB.
+
+    Regression: the gate required a block to sit a fixed 8 dB above the tracked noise floor before it could
+    be speech. On an AGC'd capture the entire level range is ~6 dB, so that bar is never cleared: the
+    session hears 1 % of blocks, no utterance is ever finalised and the caller is scored HUMAN for want of
+    any audio at all. Measured on a real call re-rendered through a room-and-microphone channel, the gate
+    kept 0 % of the caller's speech before this and hears it after. The bar now scales with the dynamic
+    range actually present, with a 3 dB minimum so a steady room cannot pass.
+    """
+    rng = np.random.default_rng(11)
+    floor_db, speech_db = -31.0, -26.0            # a 5 dB span, the signature of a compressing microphone
+    noise = lambda n: rng.standard_normal(n).astype(np.float32) * 10 ** (floor_db / 20)
+    with TestClient(main_mod.app) as c, c.websocket_connect("/ws/live") as ws:
+        ws.send_json({"type": "start", "floor_dbfs": floor_db})
+        sent = _greeting(ws, noise)
+        sent = _stream(ws, noise(8000), sent)
+        sp = _speech(rng, 2.5, speech_db)
+        sent = _stream(ws, sp + noise(len(sp)), sent)
+        sent = _stream(ws, noise(8000 * 2), sent)
+        vad = _recv(ws, "vad", where=lambda m: m["state"] == "talking" and m["speaking"])
+        assert vad["awaiting"] is True
+        said = _recv(ws, "caller_said")
+        assert "hola" in said["text"]
+        ws.send_json({"type": "stop"})
+        fin = _recv(ws, "final", limit=150)
+        assert fin["result"]["live"]["utterances"] >= 1

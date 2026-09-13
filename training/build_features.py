@@ -9,7 +9,9 @@ Optional:
                        so the model sees short excerpts too (ids get a "#clipN" suffix).
     --embeddings       also compute SSL embeddings (needs torch + transformers) -> data/embeddings.npz
     --extra DIR CSV    additional labelled corpus (e.g. data/tts_corpus built by training/tts_corpus.py); its
-                       manifest may carry `group` (cross-validation group) and `source` columns
+                       manifest may carry `group` (cross-validation group), `source`, `profile` and
+                       `channel` columns; the channel family and timing profile are copied into the feature
+                       table so the training report can break results down by call condition.
 """
 from __future__ import annotations
 
@@ -28,6 +30,18 @@ if ROOT not in sys.path:
 
 from backend.audio import call_from_arrays, load_call  # noqa: E402
 from backend.scoring.pipeline import extract  # noqa: E402
+
+
+def channel_family(row: dict) -> str:
+    """The `channel` column is the JSON description written by training/channels.py."""
+    raw = row.get("channel") or ""
+    if not raw:
+        return "original"
+    try:
+        import json
+        return str(json.loads(raw).get("family", "sim"))
+    except Exception:
+        return "sim"
 
 
 def _one(args):
@@ -87,12 +101,13 @@ def main() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(a.out)) or ".", exist_ok=True)
     with open(a.out, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["id", "anon_id", "label", "split", "duration_s", "group", "source"] + keys)
+        w.writerow(["id", "anon_id", "label", "split", "duration_s", "group", "source", "channel", "profile"] + keys)
         for rid in sorted(results):
             base = rid.split("#")[0]
             m = meta[base]
             f = results[rid]
-            w.writerow([rid, base, m["label"], m["split"], m.get("duration_s", ""), m.get("group") or base, m["_source"]] +
+            w.writerow([rid, base, m["label"], m["split"], m.get("duration_s", ""), m.get("group") or base, m["_source"],
+                        channel_family(m), m.get("profile", "")] +
                        [("" if (f.get(k) is None or not np.isfinite(f.get(k, np.nan))) else f[k]) for k in keys])
     print(f"wrote {a.out}: {len(results)} rows x {len(keys)} features in {time.time() - t0:.0f}s; errors: {len(errors)}")
     for e in errors[:10]:
