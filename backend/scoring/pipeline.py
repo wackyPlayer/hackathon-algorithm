@@ -98,7 +98,10 @@ class Analyzer:
 
     # ------------------------------------------------------------------ main entry
     def analyze(self, call: Call, agent_segments: list | None = None, agent_text_turns: list | None = None,
-                want_ui: bool = True, allow_semantic: bool = True, force_semantic: bool = False) -> dict:
+                want_ui: bool = True, allow_semantic: bool = True, force_semantic: bool = False,
+                transcript: dict | None = None) -> dict:
+        """`transcript` ({"caller": [{start, end, text}], "agent": [...]}) lets a caller that was already
+        transcribed (the live call) go straight to the semantic judge without a second pass of speech recognition."""
         t0 = time.time()
         ex = extract(call, agent_segments=agent_segments, want_ui=want_ui)
         feats = ex.features
@@ -127,7 +130,7 @@ class Analyzer:
             mode == "always" or (mode == "uncertain" and settings.semantic_low < p < settings.semantic_high)))
         if want_sem:
             from ..features.semantic import semantic_analysis
-            semantic = semantic_analysis(call, ex.vad_c, ex.vad_a, agent_text_turns=agent_text_turns)
+            semantic = semantic_analysis(call, ex.vad_c, ex.vad_a, agent_text_turns=agent_text_turns, transcript=transcript)
             if semantic.get("available"):
                 feats.update(semantic.get("features", {}))
                 aspects = heuristics.aspect_scores(feats)

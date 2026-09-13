@@ -202,7 +202,7 @@ async def analyze(request: Request, semantic: int = 0, ui: int = 1, sample: str 
 @app.get("/health")
 async def health():
     an: Analyzer | None = STATE["analyzer"]
-    from .features.semantic import claude_available, whisper_available
+    from .features.semantic import claude_available, judge_engine, whisper_available
     det = an.detector if an else None
     return {
         "status": "ok" if an else "starting",
@@ -212,6 +212,7 @@ async def health():
         "semantic_mode": settings.semantic_mode,
         "whisper_available": whisper_available(),
         "claude_available": claude_available(),
+        "judge_engine": judge_engine(),
         "gemini_available": gemini_available(),
         "gemini_model": settings.gemini_model,
         "elevenlabs_available": elevenlabs_available(),
@@ -361,7 +362,8 @@ class LiveSession:
         self.floor_db = -60.0
         self.seeded = False
         self.level_db, self.mod_db, self.flat = -100.0, 0.0, 1.0
-        self.hear = "quiet"                          # quiet | noise | talking
+        self.hear = "quiet"                          # quiet | noise | talking (per block)
+        self.last_talk_t = -10.0
         self.hear_sent, self.hear_sent_t = "", -10.0
         self.noise_run = 0
         self.speaking = False
@@ -433,6 +435,7 @@ class LiveSession:
                 self.noise_run = 0
             self.hear = state
             if state == "talking":
+                self.last_talk_t = t
                 self.talk_levels.append(db)
                 if len(self.talk_levels) >= 10:
                     self.talk_peak = float(np.percentile(self.talk_levels, 90))
@@ -528,14 +531,26 @@ class LiveSession:
     async def status(self, text: str) -> None:
         await self.send({"type": "status", "text": text})
 
+    def hearing(self) -> str:
+        """Smoothed statement for the UI: a person keeps talking through the dips between syllables, so
+        'talking' holds for 0.6 s after the last talking block (or while a confirmed turn is open); a raised
+        but steady level has to last 0.3 s to be called background noise."""
+        now = self.seconds()
+        if (self.speaking and self.utt_talk >= 4) or now - self.last_talk_t < 0.6:
+            return "talking"
+        if self.hear == "noise" and self.noise_run >= 3:
+            return "noise"
+        return "quiet"
+
     async def hear_feedback(self) -> None:
         """Tell the browser what the server hears: talking, background noise or quiet (and the numbers)."""
         now = self.seconds()
-        changed = self.hear != self.hear_sent
-        due = now - self.hear_sent_t >= (1.0 if self.hear != "quiet" else 3.0)
+        state = self.hearing()
+        changed = state != self.hear_sent
+        due = now - self.hear_sent_t >= (1.0 if state != "quiet" else 3.0)
         if changed or due:
-            self.hear_sent, self.hear_sent_t = self.hear, now
-            await self.send({"type": "vad", "state": self.hear, "speaking": bool(self.speaking and self.utt_talk >= 4),
+            self.hear_sent, self.hear_sent_t = state, now
+            await self.send({"type": "vad", "state": state, "speaking": bool(self.speaking and self.utt_talk >= 4),
                              "awaiting": self.await_answer, "peak_db": None if self.talk_peak is None else round(self.talk_peak, 1),
                              "level_db": round(self.level_db, 1), "floor_db": round(self.floor_db, 1),
                              "mod_db": round(self.mod_db, 1), "voiced": bool(self.flat < 0.35), "t": round(now, 2)})
@@ -683,12 +698,18 @@ class LiveSession:
             return None
         call = call_from_arrays(x, None)
         segs = self.agent_segments()
-        res = await run_in_threadpool(self.an.analyze, call, segs, self.agent_text_turns(), final, final, False)
+        agent_turns = self.agent_text_turns()
+        # end of call: the semantic check judges what the caller *said* (repeat-backs, the non-existent product)
+        # from the transcript the call already produced; Claude if configured, else Gemini
+        from .features.semantic import judge_available
+        judge_now = final and bool(self.caller_turns) and judge_available()
+        transcript = {"caller": self.caller_turns, "agent": agent_turns} if judge_now else None
+        res = await run_in_threadpool(self.an.analyze, call, segs, agent_turns, final, final, judge_now, transcript)
         if not final:
             self.note_result(res)
         res["live"] = {"seconds": round(self.seconds(), 1), "agent_turns": len(segs), "step": self.step,
                        "caller_turns": self.caller_turns if final else len(self.caller_turns),
-                       "utterances": self.utterances, "floor_db": round(self.floor_db, 1), "hear": self.hear,
+                       "utterances": self.utterances, "floor_db": round(self.floor_db, 1), "hear": self.hearing(),
                        "p_avg": None if self.p_avg is None else round(self.p_avg, 3), "p_updates": len(self.p_hist),
                        "escalated": self.escalated(), "level": level_for(self.p_avg),
                        "brain": "gemini" if self.brain.enabled else "canned", "voice": "elevenlabs" if self.voice.enabled else "browser"}

@@ -3,26 +3,35 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Altur Voice Shield</title>
-<link rel="preload" href="/static/fonts/MonsterFriendFore.otf" as="font" type="font/otf" crossorigin>
-<link rel="preload" href="/static/fonts/monobit.ttf" as="font" type="font/ttf" crossorigin>
+<title>Calliope · autenticación de voz con IA</title>
+<script>try { const t = localStorage.getItem("theme"); if (t) document.documentElement.setAttribute("data-theme", t); } catch (e) {}</script>
+<link rel="preload" href="/static/fonts/switzer-400.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/switzer-700.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header>
   <div class="brand">
-    <span class="logo">&#9673;</span>
+    <svg viewBox="0 0 42 48" aria-hidden="true">
+      <path d="M21 1 C31 1 41 4 41 4 L41 22 C41 36 30 44 21 47 C12 44 1 36 1 22 L1 4 C1 4 11 1 21 1 Z" fill="#2f6be4"/>
+      <g fill="#fff">
+        <rect x="14" y="10" width="2.2" height="6" rx="1.1"/><rect x="18" y="7" width="2.2" height="9" rx="1.1"/><rect x="22" y="9" width="2.2" height="7" rx="1.1"/><rect x="26" y="11" width="2.2" height="5" rx="1.1"/>
+        <path d="M21 18 C17.7 18 15.5 20.3 15.5 23.5 L15.5 26 L13.5 26 L13.5 36 L28.5 36 L28.5 26 L26.5 26 L26.5 23.5 C26.5 20.3 24.3 18 21 18 Z M21 20.4 C22.9 20.4 24.1 21.7 24.1 23.5 L24.1 26 L17.9 26 L17.9 23.5 C17.9 21.7 19.1 20.4 21 20.4 Z"/>
+      </g>
+      <circle cx="21" cy="30.5" r="1.6" fill="#2f6be4"/><rect x="20.3" y="30.5" width="1.4" height="2.8" fill="#2f6be4"/>
+    </svg>
     <div>
-      <h1>Altur Voice Shield</h1>
-      <div class="sub meta">Real-time synthetic caller detection · caller = channel 0, agent = channel 1</div>
+      <div class="wordmark">CALLIOPE</div>
+      <div class="tagline">autenticación de voz con IA · caller = channel 0, agent = channel 1</div>
     </div>
   </div>
-  <div class="live-controls">
+  <div class="header-tools">
     <button id="share-btn" class="hidden">Share link</button>
     <div id="health" class="pill">connecting…</div>
+    <button id="theme-btn" class="theme-btn" title="Toggle dark mode" aria-label="Toggle dark mode">◐</button>
   </div>
 </header>
-<div id="share-box" class="card hidden" style="margin:12px 22px 0"></div>
+<div id="share-box" class="card hidden" style="margin:12px 28px 0"></div>
 
 <nav class="tabs">
   <button class="tab active" data-tab="analyze">Analyze recording</button>
@@ -36,11 +45,11 @@
     <div class="row">
       <div id="drop" class="drop">
         <input id="file" type="file" accept=".wav,audio/wav,audio/x-wav" hidden>
-        <div class="drop-title">Drop a call recording here (WAV, 8 kHz stereo) or click to choose</div>
+        <div class="drop-title">Drop a call recording (WAV, 8 kHz stereo) or click to choose</div>
         <div class="drop-sub">Mono files are analysed as caller-only. Other sample rates are resampled.</div>
       </div>
       <div class="options">
-        <label><input id="opt-semantic" type="checkbox"> Run semantic layer (transcribe + LLM judge, slower)</label>
+        <label><input id="opt-semantic" type="checkbox"> Run the semantic check (transcribe both sides and judge what the caller says; slower)</label>
         <label><input id="opt-batch" type="checkbox"> Batch mode: run every dropped file through <code>/detect</code> only</label>
         <div id="samples-box" class="hidden">
           <label>Or pick a dataset call: <select id="sample"></select> <button id="sample-go">Analyze</button></label>
@@ -69,15 +78,14 @@
           <div class="cap you"><span class="kind">you</span><span id="cap-you">—</span></div>
         </div>
         <div id="hearing" class="hearing">hearing: —</div>
-        <p class="muted small">You are the caller. The bank agent "Marina" is generated live: Gemini writes each line from what you
-          just said, ElevenLabs speaks it (browser voice if no key is configured), and Whisper on the server hears you.
-          The agent runs the same verification flow as Altur's: greeting, a question it deliberately interrupts, a folio
-          you must repeat back, a probe about an insurance product that does not exist, a 5-second silence, a last
-          question, a closing. Marina distrusts the caller by default, sees the detector's running score at every turn and
-          uses tactics that trip up an LLM caller; once the call average passes 70% synthetic she adds a challenge step and
-          asks harder questions. Your microphone is streamed at 8 kHz; the verdict updates every 2 seconds. The microphone
-          is checked first (2 s of silence, then a sentence) so you know whether this input could bias the verdict, and the
-          "hearing" line tells you whether the server takes the input as talking, background noise or quiet.</p>
+        <p class="muted small">You are the caller. The bank agent "Marina" is generated live (Gemini writes each line, ElevenLabs speaks it,
+          Whisper on the server hears you) and runs the three security checks of the brief: the <b>voice</b> itself, the
+          <b>conversation</b> (she interrupts you, falls silent for 5 s and talks over you; people recover instantly and messily,
+          machines consistently) and the <b>semantics</b> (a folio you must repeat back, an insurance product that does not
+          exist; a person says "I don't have that", a language model invents an answer). She distrusts the caller by default,
+          sees the detector's running score every turn, and once the call average passes 70 % synthetic she adds a challenge
+          step and asks harder questions. The microphone is checked first, and the "hearing" line says whether the server
+          takes the input as talking, background noise or quiet.</p>
         <div id="agent-log" class="agent-log"></div>
       </div>
       <div class="card live-verdict">
@@ -88,8 +96,8 @@
         <div id="live-avg" class="meta"></div>
         <div class="pbar"><div id="live-pfill" class="pfill"></div><div class="pmark"></div></div>
         <div class="pbar-labels"><span id="live-lab-human" class="lab human">Human</span><span id="live-lab-synthetic" class="lab synthetic">Synthetic</span></div>
+        <div id="live-checks" class="checks"></div>
         <canvas id="live-spark" width="340" height="70"></canvas>
-        <div id="live-cues" class="cues"></div>
         <details class="section"><summary>All indicators</summary><div id="live-aspects" class="mini-aspects"></div></details>
       </div>
     </div>
@@ -111,7 +119,7 @@
 {"is_synthetic": true, "confidence": 0.93}</pre>
       <p><code>confidence</code> is the probability that the returned verdict is correct (0.5 – 1.0). The raw
         <code>p_synthetic</code>, per-aspect scores, attack profile, turn timeline and feature vector are returned by
-        <code>POST /analyze</code> (same body; add <code>?semantic=1</code> to force the transcript judge).</p>
+        <code>POST /analyze</code> (same body; add <code>?semantic=1</code> to run the transcript judge).</p>
       <h2>Other routes</h2>
       <p><code>GET /health</code> · <code>GET /samples</code> · <code>POST /analyze?sample=name.wav</code> ·
         <code>WS /ws/live</code> (live call: int16 8 kHz PCM frames in, agent lines and rolling verdicts out) ·
@@ -136,11 +144,15 @@
     <div class="meta" data-f="meta"></div>
     <div class="pbar"><div class="pfill" data-f="pfill"></div><div class="pmark"></div></div>
     <div class="pbar-labels"><span class="lab human" data-f="lab-human">Human</span><span class="lab synthetic" data-f="lab-synthetic">Synthetic</span></div>
-    <div class="cues" data-f="cues"></div>
+    <div class="checks" data-f="checks"></div>
     <details class="section" data-f="ind">
-      <summary>Why this result · all indicators <span class="hint">(0 = human-like, 100 = synthetic-like; click one for its measurements)</span></summary>
+      <summary>All indicators <span class="hint">(0 = human-like, 100 = synthetic-like; click one for its measurements)</span></summary>
       <div data-f="aspects" class="aspects"></div>
     </details>
+  </div>
+  <div class="card hidden" data-f="sem-card">
+    <h2>Semantic check · transcript &amp; judge</h2>
+    <div data-f="sem"></div>
   </div>
   <div class="card">
     <h2>Caller spectrogram &amp; turn timeline</h2>
@@ -170,10 +182,6 @@
     <summary>Why the model decided <span class="hint">(logit contributions of the trained model)</span></summary>
     <div data-f="contrib"></div>
   </details>
-  <div class="card hidden" data-f="sem-card">
-    <h2>Transcript &amp; semantic judge</h2>
-    <div data-f="sem"></div>
-  </div>
   <details class="card section"><summary>Raw JSON</summary><pre data-f="raw"></pre></details>
 </template>
 

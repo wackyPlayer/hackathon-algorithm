@@ -1,4 +1,4 @@
-/* Altur Voice Shield dashboard - vanilla JS, no build step. */
+/* Calliope dashboard - vanilla JS, no build step. */
 "use strict";
 
 const $ = (s, r = document) => r.querySelector(s);
@@ -6,6 +6,21 @@ const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const fmt = (x, d = 2) => (x === null || x === undefined || Number.isNaN(x)) ? "—" : Number(x).toFixed(d);
 const pct = (x) => (x === null || x === undefined) ? "—" : Math.round(x * 100) + "%";
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// ------------------------------------------------------------------ theme (light / dark)
+function currentTheme() {
+  const t = document.documentElement.getAttribute("data-theme");
+  if (t) return t;
+  return window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+function applyTheme(t) {
+  document.documentElement.setAttribute("data-theme", t);
+  try { localStorage.setItem("theme", t); } catch (e) { /* storage blocked */ }
+  $("#theme-btn").textContent = t === "dark" ? "☀" : "☾";
+  $("#theme-btn").title = t === "dark" ? "Switch to light mode" : "Switch to dark mode";
+}
+$("#theme-btn").textContent = currentTheme() === "dark" ? "☀" : "☾";
+$("#theme-btn").addEventListener("click", () => applyTheme(currentTheme() === "dark" ? "light" : "dark"));
 
 // ------------------------------------------------------------------ tabs + health + share
 $$(".tab").forEach(b => b.addEventListener("click", () => {
@@ -19,8 +34,9 @@ async function loadHealth() {
     const r = await fetch("/health");
     HEALTH = await r.json();
     const el = $("#health");
-    el.textContent = `${HEALTH.status} · ${HEALTH.mode}` + (HEALTH.model_meta && HEALTH.model_meta.val_auc ? ` · val AUC ${fmt(HEALTH.model_meta.val_auc, 3)}` : "") +
-      ` · agent: ${HEALTH.gemini_available ? "gemini" : "scripted"} + ${HEALTH.elevenlabs_available ? "elevenlabs" : "browser voice"}`;
+    el.textContent = `${HEALTH.status} · ${HEALTH.mode.replace("_", " ")}` + (HEALTH.model_meta && HEALTH.model_meta.val_auc ? ` · val AUC ${fmt(HEALTH.model_meta.val_auc, 3)}` : "") +
+      ` · agent ${HEALTH.gemini_available ? "gemini" : "scripted"} + ${HEALTH.elevenlabs_available ? "elevenlabs" : "browser voice"}` +
+      ` · judge ${HEALTH.judge_engine || "off"}`;
     el.className = "pill " + (HEALTH.status === "ok" ? "ok" : "bad");
     $("#health-json").textContent = JSON.stringify(HEALTH, null, 2);
     if (!HEALTH.whisper_available) { $("#opt-semantic").disabled = true; $("#opt-semantic").parentElement.title = "faster-whisper not installed on the server"; }
@@ -131,10 +147,40 @@ function fileToBase64(file) {
 
 // ------------------------------------------------------------------ result renderer
 function scoreColor(s) {
-  return s === null || s === undefined ? "#3b3630" : (s < 0.4 ? "var(--human)" : (s > 0.6 ? "var(--synthetic)" : "var(--warn)"));
+  return s === null || s === undefined ? "var(--dim)" : (s < 0.4 ? "var(--human)" : (s > 0.6 ? "var(--synthetic)" : "var(--warn)"));
 }
 
-// The few indicators that matter most for this verdict: strongest deviation from neutral, weighted.
+// The three security checks of the brief, each summarising a family of indicators.
+const CHECKS = [
+  { key: "voice", name: "Voice", aspects: ["bandwidth_cut", "prosody_flatness", "vocoder_artifacts", "breathing_absence", "hard_cuts", "injection_signature"],
+    what: "How the voice itself sounds: band shape, prosody, vocoder texture, breathing, noise floor." },
+  { key: "conversation", name: "Conversation", aspects: ["turn_taking"],
+    what: "How the caller handles the agent interrupting, falling silent and talking over them: people recover instantly and messily, machines consistently." },
+  { key: "semantics", name: "Semantics", aspects: ["semantic_fabrication", "llm_style"],
+    what: "What the caller says when asked to repeat information or about things that do not exist: a person says \"I don't have that\", a language model invents an answer." },
+];
+
+function checkScores(aspects) {
+  return CHECKS.map(c => {
+    const items = c.aspects.map(k => (aspects || {})[k]).filter(a => a && a.score !== null && a.score !== undefined && a.n_terms > 0);
+    if (!items.length) return { ...c, score: null, why: c.key === "semantics" ? "not run: tick the semantic check, or end a live call" : "no cues in this clip" };
+    const w = items.reduce((s, a) => s + (a.weight || 1), 0);
+    const score = items.reduce((s, a) => s + a.score * (a.weight || 1), 0) / w;
+    // the strongest cue that points the same way as the check's own score
+    let best = null;
+    for (const a of items) for (const e of (a.evidence || [])) { const d = score >= 0.5 ? e.score - 0.5 : 0.5 - e.score; if (!best || d > best.d) best = { d, e }; }
+    const why = best ? `${best.e.desc}: ${fmt(best.e.value, 2)} · ${best.e.read}` : items[0].label;
+    return { ...c, score, why };
+  });
+}
+
+function checksHtml(list, compact = false) {
+  return list.map(c => `<div class="check"><div class="check-head"><span class="check-name">${esc(c.name)}</span>${c.score === null ? `<span class="check-score na">n/a</span>` : `<span class="check-score" style="color:${scoreColor(c.score)}">${Math.round(c.score * 100)}</span>`}</div>
+    <div class="bar"><i style="width:${c.score === null ? 0 : c.score * 100}%;background:${scoreColor(c.score)}"></i></div>
+    <div class="check-why">${esc(c.why)}</div>${compact ? "" : `<div class="check-what">${esc(c.what)}</div>`}</div>`).join("");
+}
+
+// Indicators that matter most for this verdict: strongest deviation from neutral, weighted.
 function topCues(aspects, n = 3) {
   return Object.entries(aspects || {})
     .filter(([, a]) => a.score !== null && a.score !== undefined && a.n_terms > 0)
@@ -143,12 +189,7 @@ function topCues(aspects, n = 3) {
     .slice(0, n);
 }
 
-function cueHtml(c) {
-  const read = c.score > 0.6 ? "synthetic-like" : (c.score < 0.4 ? "human-like" : "neutral");
-  return `<div class="cue" title="${esc(read)}"><div class="cue-head"><span class="cue-name">${esc(c.label)}</span><span class="cue-score">${Math.round(c.score * 100)}</span></div><div class="bar"><i style="width:${c.score * 100}%;background:${scoreColor(c.score)}"></i></div></div>`;
-}
-
-// Human / Synthetic labels under the bar: both glow until a verdict exists, then the loser turns gray.
+// Human / Synthetic labels under the bar: both ringed until a verdict exists, then the loser turns gray.
 function setLabels(human, synthetic, res, unsure) {
   for (const el of [human, synthetic]) el.classList.remove("selected", "dim");
   if (unsure || !res) return;
@@ -160,8 +201,35 @@ function metaLine(res, title) {
   const parts = [];
   if (title) parts.push(title);
   parts.push(`${fmt(res.duration_seconds, 1)} s of audio`, `${fmt(res.speech_seconds, 1)} s of caller speech`, `evidence ${pct(res.evidence_level)}`, res.mode.replace("_", " "), `${fmt(res.timing && res.timing.total_s)} s`);
-  if (res.input && !res.input.has_agent_channel) parts.push("no agent channel: turn-taking signals unavailable");
+  if (res.input && !res.input.has_agent_channel) parts.push("no agent channel: conversation signals unavailable");
   return parts.join(" · ");
+}
+
+function judgeHtml(s) {
+  let html = "";
+  const tr = (s.available && s.transcript) ? s.transcript : null;
+  if (s.judge) {
+    const j = s.judge;
+    html += `<div class="judge"><div><span>synthetic</span><b style="color:${scoreColor(j.synthetic_probability)}">${pct(j.synthetic_probability)}</b></div>
+      <div><span>invents answers</span><b style="color:${scoreColor(j.fabrication_probability)}">${pct(j.fabrication_probability)}</b></div>
+      <div><span>LLM-like wording</span><b style="color:${scoreColor(j.llm_style_probability)}">${pct(j.llm_style_probability)}</b></div>
+      <div><span>repeat-back</span><b>${esc(j.repeat_back)}</b></div></div>`;
+    if (j.nonexistent_probes && j.nonexistent_probes.length) html += `<h2>Questions about things that do not exist</h2><ul>${j.nonexistent_probes.map(q => `<li><i>${esc(q.agent_question)}</i> → <b class="${q.caller_reaction === "invented" ? "pos" : (q.caller_reaction === "denied" ? "neg" : "")}">${esc(q.caller_reaction)}</b></li>`).join("")}</ul>`;
+    html += `<p>${esc(j.rationale)}</p>`;
+    if (j.fabrication_evidence && j.fabrication_evidence.length) html += `<div class="meta">evidence: ${esc(j.fabrication_evidence.join("; "))}</div>`;
+    if (j.human_markers && j.human_markers.length) html += `<div class="meta">human markers: ${esc(j.human_markers.join("; "))}</div>`;
+    html += `<div class="meta">judge: ${esc(j.engine || s.judge_engine || "")}${s.llm_seconds ? " · " + fmt(s.llm_seconds, 1) + " s" : ""}</div>`;
+  } else if (s.judge_error) {
+    html += `<div class="muted">judge not run: ${esc(s.judge_error)}</div>`;
+  } else if (s.error) {
+    html += `<div class="muted">${esc(s.error)}</div>`;
+  }
+  if (tr) {
+    const turns = [...tr.agent.map(t => ({ ...t, who: "agent" })), ...tr.caller.map(t => ({ ...t, who: "caller" }))].sort((a, b) => a.start - b.start);
+    html += `<h2 class="mt">Transcript</h2><div class="transcript">${turns.map(t => `<div class="t ${t.who}"><span class="meta">${fmt(t.start, 1)}s ${t.who}</span> ${esc(t.text)}</div>`).join("")}</div>`;
+    if (s.stt_seconds) html += `<div class="meta">transcription ${fmt(s.stt_seconds, 1)} s</div>`;
+  }
+  return html;
 }
 
 function renderResult(res, root, title) {
@@ -170,23 +238,21 @@ function renderResult(res, root, title) {
   const p = res.p_synthetic;
   const v = f("verdict");
   const unsure = res.evidence_level < 0.5;
-  v.textContent = unsure ? "INSUFFICIENT EVIDENCE" : res.verdict;
+  v.textContent = unsure ? "Insufficient evidence" : (res.verdict === "SYNTHETIC" ? "Synthetic" : "Human");
   v.className = "verdict-big " + (unsure ? "unsure" : res.verdict.toLowerCase());
   f("confidence").textContent = pct(res.confidence);
   f("p").textContent = fmt(p, 3);
   f("meta").textContent = metaLine(res, title);
-  // flat rectangular probability bar: fill = p(synthetic), colour by verdict
   const fill = f("pfill");
   fill.style.width = (p * 100) + "%";
   fill.style.background = unsure ? "var(--warn)" : (res.is_synthetic ? "var(--synthetic)" : "var(--human)");
   tpl.querySelector(".pmark").style.left = (p * 100) + "%";
   setLabels(f("lab-human"), f("lab-synthetic"), res, unsure);
 
-  // top cues (always visible) + all indicators (expandable)
-  const cues = topCues(res.aspects);
-  f("cues").innerHTML = (cues.length ? `<span class="cues-label meta">strongest cues</span>` : "") + cues.map(cueHtml).join("");
+  // the three security checks + all indicators (expandable)
+  f("checks").innerHTML = checksHtml(checkScores(res.aspects));
   const asp = f("aspects");
-  const topKeys = new Set(cues.map(c => c.key));
+  const topKeys = new Set(topCues(res.aspects).map(c => c.key));
   for (const [k, a] of Object.entries(res.aspects)) {
     const d = document.createElement("div");
     const s = a.score;
@@ -229,29 +295,12 @@ function renderResult(res, root, title) {
   } else {
     f("contrib-card").classList.add("hidden");
   }
-  // semantic / transcript
+  // semantic check: transcript + judge
   const liveTurns = res.live && Array.isArray(res.live.caller_turns) ? res.live.caller_turns : null;
   if (res.semantic || liveTurns) {
     f("sem-card").classList.remove("hidden");
-    const s = res.semantic || {};
-    let html = "";
-    const tr = (s.available && s.transcript) ? s.transcript : (liveTurns ? { agent: [], caller: liveTurns } : null);
-    if (tr) {
-      const turns = [...tr.agent.map(t => ({ ...t, who: "agent" })), ...tr.caller.map(t => ({ ...t, who: "caller" }))].sort((a, b) => a.start - b.start);
-      html += `<div class="transcript">${turns.map(t => `<div class="t ${t.who}"><span class="meta">${fmt(t.start, 1)}s ${t.who}</span> ${esc(t.text)}</div>`).join("")}</div>`;
-      if (s.stt_seconds) html += `<div class="meta">transcription ${fmt(s.stt_seconds, 1)} s${s.llm_seconds ? ", judge " + fmt(s.llm_seconds, 1) + " s" : ""}</div>`;
-    }
-    if (s.judge) {
-      const j = s.judge;
-      html += `<h2 class="mt">Judge</h2><p><b>synthetic ${pct(j.synthetic_probability)}</b> · fabrication ${pct(j.fabrication_probability)} · LLM style ${pct(j.llm_style_probability)} · repeat-back: ${esc(j.repeat_back)}</p><p>${esc(j.rationale)}</p>`;
-      if (j.nonexistent_probes && j.nonexistent_probes.length) html += `<ul>${j.nonexistent_probes.map(q => `<li><i>${esc(q.agent_question)}</i> → <b>${esc(q.caller_reaction)}</b></li>`).join("")}</ul>`;
-      if (j.human_markers && j.human_markers.length) html += `<div class="meta">human markers: ${esc(j.human_markers.join("; "))}</div>`;
-    } else if (s.judge_error) {
-      html += `<div class="muted">judge not run: ${esc(s.judge_error)}</div>`;
-    } else if (s.error) {
-      html += `<div class="muted">${esc(s.error)}</div>`;
-    }
-    f("sem").innerHTML = html;
+    const s = res.semantic || { available: !!liveTurns, transcript: liveTurns ? { agent: [], caller: liveTurns } : null, judge_error: "no judge credentials" };
+    f("sem").innerHTML = judgeHtml(s);
   }
   f("raw").textContent = JSON.stringify({ ...res, ui: res.ui ? "(omitted)" : undefined }, null, 1);
   root.innerHTML = "";
@@ -259,15 +308,15 @@ function renderResult(res, root, title) {
 }
 
 function eventChips(events) {
-  const lab = { response: e => `↳ response ${fmt(e.latency)} s @${fmt(e.t, 1)}`, agent_interrupt: e => `agent interrupts @${fmt(e.t, 1)}: yields after ${fmt(e.yield)} s${e.restart ? ", restarts" : ""}`,
+  const lab = { response: e => `response ${fmt(e.latency)} s @${fmt(e.t, 1)}`, agent_interrupt: e => `agent interrupts @${fmt(e.t, 1)}: yields after ${fmt(e.yield)} s${e.restart ? ", restarts" : ""}`,
     caller_interrupt: e => `caller interrupts @${fmt(e.t, 1)} (${fmt(e.dur)} s)`, backchannel: e => `back-channel @${fmt(e.t, 1)}`,
     silence_fill: e => `caller fills silence after ${fmt(e.after)} s @${fmt(e.t, 1)}`, agent_fills_silence: e => `agent fills silence after ${fmt(e.after)} s`, false_start: e => `false start @${fmt(e.t, 1)}` };
   return (events || []).slice(0, 80).map(e => `<span>${(lab[e.type] || (x => x.type))(e)}</span>`).join("") || "<span>no turn events</span>";
 }
 
-// flat, warm colormap
+// blue-tinted colormap for the spectrogram (dark ground in both themes)
 function cmap(v) {
-  const stops = [[10, 9, 8], [46, 30, 42], [96, 46, 66], [150, 66, 66], [196, 104, 60], [222, 156, 60], [236, 205, 110], [240, 232, 200]];
+  const stops = [[8, 10, 16], [24, 34, 68], [46, 72, 140], [47, 107, 228], [96, 160, 246], [170, 205, 250], [225, 236, 252], [250, 252, 255]];
   const x = Math.max(0, Math.min(1, v / 255)) * (stops.length - 1);
   const i = Math.floor(x), t = x - i, a = stops[i], b = stops[Math.min(i + 1, stops.length - 1)];
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
@@ -278,10 +327,11 @@ function drawSpectrogram(canvas, res) {
   const W = canvas.clientWidth || 900, H = 300;
   canvas.width = W * devicePixelRatio; canvas.height = H * devicePixelRatio;
   const ctx = canvas.getContext("2d"); ctx.scale(devicePixelRatio, devicePixelRatio);
-  ctx.fillStyle = "#0a0908"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#1c1d21"; ctx.fillRect(0, 0, W, H);
   const dur = res.duration_seconds || 1;
   const specH = 190, laneY = specH + 8, laneH = 18, evY = laneY + laneH * 2 + 10;
   const X = t => (t / dur) * W;
+  const font = "12px Switzer, sans-serif";
   if (sp && sp.data) {
     const bytes = Uint8Array.from(atob(sp.data), c => c.charCodeAt(0));
     const off = document.createElement("canvas"); off.width = sp.cols; off.height = sp.rows;
@@ -291,7 +341,7 @@ function drawSpectrogram(canvas, res) {
     ctx.imageSmoothingEnabled = false;
     ctx.drawImage(off, 0, 0, W, specH);
     if (ui.f0) {
-      ctx.strokeStyle = "#4cc3d9"; ctx.lineWidth = 1.5; ctx.beginPath(); let pen = false;
+      ctx.strokeStyle = "#22d3ee"; ctx.lineWidth = 1.5; ctx.beginPath(); let pen = false;
       for (const [t, f] of ui.f0) {
         if (f === null) { pen = false; continue; }
         const x = X(t), y = specH - (f / (sp.fmax || 4000)) * specH;
@@ -301,22 +351,22 @@ function drawSpectrogram(canvas, res) {
     }
     ctx.fillStyle = "rgba(148,163,184,.55)";
     for (const [s, e] of (ui.breaths || [])) ctx.fillRect(X(s), specH - 12, Math.max(2, X(e) - X(s)), 12);
-    ctx.fillStyle = "#a39a89"; ctx.font = "13px 'Monobit', monospace";
-    ctx.fillText("4 KHZ", 4, 13); ctx.fillText("0", 4, specH - 4);
+    ctx.fillStyle = "#9aa0ac"; ctx.font = font;
+    ctx.fillText("4 kHz", 6, 14); ctx.fillText("0", 6, specH - 5);
   }
-  ctx.fillStyle = "#24211e"; ctx.fillRect(0, laneY, W, laneH); ctx.fillRect(0, laneY + laneH + 2, W, laneH);
-  ctx.fillStyle = "#6b8fd6"; for (const [s, e] of (tl.agent || [])) ctx.fillRect(X(s), laneY + 2, Math.max(1, X(e) - X(s)), laneH - 4);
-  ctx.fillStyle = "#d69a5c"; for (const [s, e] of (tl.caller_phrases || tl.caller || [])) ctx.fillRect(X(s), laneY + laneH + 4, Math.max(1, X(e) - X(s)), laneH - 4);
-  ctx.fillStyle = "#a39a89"; ctx.font = "12px 'Monobit', monospace"; ctx.fillText("AGENT", 3, laneY + 13); ctx.fillText("CALLER", 3, laneY + laneH + 15);
-  const colors = { response: "#a78bfa", agent_interrupt: "#e07aa8", silence_fill: "#e0b34a", backchannel: "#5fb98f", caller_interrupt: "#e07aa8", false_start: "#94a3b8" };
+  ctx.fillStyle = "#2a2f39"; ctx.fillRect(0, laneY, W, laneH); ctx.fillRect(0, laneY + laneH + 2, W, laneH);
+  ctx.fillStyle = "#5b8def"; for (const [s, e] of (tl.agent || [])) ctx.fillRect(X(s), laneY + 2, Math.max(1, X(e) - X(s)), laneH - 4);
+  ctx.fillStyle = "#e8a05a"; for (const [s, e] of (tl.caller_phrases || tl.caller || [])) ctx.fillRect(X(s), laneY + laneH + 4, Math.max(1, X(e) - X(s)), laneH - 4);
+  ctx.fillStyle = "#e8eaef"; ctx.font = font; ctx.fillText("agent", 5, laneY + 13); ctx.fillText("caller", 5, laneY + laneH + 15);
+  const colors = { response: "#8b7cf6", agent_interrupt: "#e07aa8", silence_fill: "#e0b34a", backchannel: "#3fb98f", caller_interrupt: "#e07aa8", false_start: "#94a3b8" };
   for (const e of (res.events || [])) {
     const c = colors[e.type]; if (!c) continue;
     ctx.fillStyle = c; ctx.fillRect(X(e.t) - 1, evY, 3, 14);
-    if (e.type === "response") { ctx.fillStyle = "#a78bfa"; ctx.font = "12px 'Monobit', monospace"; ctx.fillText(fmt(e.latency, 1), X(e.t) + 3, evY + 12); }
+    if (e.type === "response") { ctx.fillStyle = "#8b7cf6"; ctx.font = font; ctx.fillText(fmt(e.latency, 1), X(e.t) + 3, evY + 12); }
   }
-  ctx.fillStyle = "#a39a89"; ctx.font = "12px 'Monobit', monospace";
+  ctx.fillStyle = "#9aa0ac"; ctx.font = font;
   const step = dur > 120 ? 30 : (dur > 40 ? 10 : 5);
-  for (let t = 0; t <= dur; t += step) { ctx.fillRect(X(t), H - 14, 1, 4); ctx.fillText(t + "S", X(t) + 2, H - 3); }
+  for (let t = 0; t <= dur; t += step) { ctx.fillRect(X(t), H - 14, 1, 4); ctx.fillText(t + "s", X(t) + 2, H - 3); }
 }
 
 // ------------------------------------------------------------------ live call (server-driven agent: Gemini + ElevenLabs)
@@ -383,7 +433,7 @@ function renderMicReport(rep, extra) {
   box.classList.remove("hidden");
   if (!rep) { box.innerHTML = `<div class="mic-head"><span class="q testing">testing</span><span class="meta">${esc(extra || "")}</span></div>`; return; }
   const m = rep.metrics || {};
-  const chips = [["speech", m.speech_seconds !== undefined ? fmt(m.speech_seconds, 1) + " s" : "—"], ["snr", m.snr_db === null || m.snr_db === undefined ? "—" : fmt(m.snr_db, 0) + " dB"],
+  const chips = [["speech", m.speech_seconds !== undefined ? fmt(m.speech_seconds, 1) + " s" : "—"], ["SNR", m.snr_db === null || m.snr_db === undefined ? "—" : fmt(m.snr_db, 0) + " dB"],
     ["floor", m.floor_dbfs === null || m.floor_dbfs === undefined ? "—" : fmt(m.floor_dbfs, 0) + " dBFS"], ["level", m.level_dbfs === null || m.level_dbfs === undefined ? "—" : fmt(m.level_dbfs, 0) + " dBFS"],
     ["peak", m.peak_dbfs === null || m.peak_dbfs === undefined ? "—" : fmt(m.peak_dbfs, 1) + " dBFS"], ["digital silence", pct(m.digital_silence_frac)],
     ["roll-off", m.rolloff_hz ? m.rolloff_hz + " Hz" : "—"], ["hum", m.hum_db === null || m.hum_db === undefined ? "—" : fmt(m.hum_db, 0) + " dB"]];
@@ -525,8 +575,8 @@ class LiveCall {
   }
   speak(text, kind, done) {
     let started = false;
-    const start = () => { if (!started) { started = true; this.sendAgent("start", text, kind); } };
-    const end = () => { start(); this.sendAgent("end", text, kind); done(); };
+    const start = () => { if (!started) { started = true; this.sendAgent("start", text, kind); $("#cap-agent").textContent = text; $(".cap.agent").classList.add("live"); } };
+    const end = () => { start(); this.sendAgent("end", text, kind); $(".cap.agent").classList.remove("live"); done(); };
     if (window.speechSynthesis && this.voice) {
       const u = new SpeechSynthesisUtterance(text); u.voice = this.voice; u.lang = this.voice.lang; u.rate = 1.0;
       // Chrome sometimes never fires onend (it can garbage-collect the utterance): keep a reference + watchdog
@@ -575,7 +625,8 @@ class LiveCall {
     const h = $("#hearing");
     const label = { talking: "talking", noise: "background noise", quiet: "quiet" }[m.state] || m.state;
     h.textContent = `hearing: ${label}` + (m.state !== "quiet" ? ` · ${fmt(m.level_db, 0)} dBFS, swing ${fmt(m.mod_db, 1)} dB` : "") +
-      ` · floor ${fmt(m.floor_db, 0)} dBFS` + (m.state === "talking" && m.voiced ? " · voiced" : "") + (m.speaking ? " · turn open" : "");
+      ` · floor ${fmt(m.floor_db, 0)} dBFS` + (m.peak_db !== null && m.peak_db !== undefined ? ` · your peaks ${fmt(m.peak_db, 0)} dBFS` : "") +
+      (m.state === "talking" && m.voiced ? " · voiced" : "") + (m.speaking ? " · turn open" : "");
     h.className = "hearing " + m.state;
     if (m.awaiting) {
       this.status(m.state === "talking" ? "hearing you…" : (m.state === "noise" ? "background noise (not taken as speech)…" : "listening…"));
@@ -585,7 +636,7 @@ class LiveCall {
   renderUpdate(r) {
     this.history.push(r.p_synthetic);
     const v = $("#live-verdict"); const unsure = r.evidence_level < 0.5;
-    v.textContent = unsure ? "…" : r.verdict; v.className = "verdict-big " + (unsure ? "unsure" : r.verdict.toLowerCase());
+    v.textContent = unsure ? "…" : (r.verdict === "SYNTHETIC" ? "Synthetic" : "Human"); v.className = "verdict-big " + (unsure ? "unsure" : r.verdict.toLowerCase());
     $("#live-conf").innerHTML = `<b>${pct(r.confidence)}</b> confidence <span class="p">· p(synthetic) = ${fmt(r.p_synthetic, 2)}</span>`;
     $("#live-meta").textContent = `${fmt(r.speech_seconds, 1)} s of caller speech · evidence ${pct(r.evidence_level)}`;
     const L = r.live || {};
@@ -597,11 +648,11 @@ class LiveCall {
     $(".live-verdict .pmark").style.left = (r.p_synthetic * 100) + "%";
     setLabels($("#live-lab-human"), $("#live-lab-synthetic"), r, unsure);
     const c = $("#live-spark"), ctx = c.getContext("2d"); ctx.clearRect(0, 0, c.width, c.height);
-    ctx.fillStyle = "#0a0908"; ctx.fillRect(0, 0, c.width, c.height); ctx.strokeStyle = "#4a443c"; ctx.beginPath(); ctx.moveTo(0, c.height / 2); ctx.lineTo(c.width, c.height / 2); ctx.stroke();
-    ctx.strokeStyle = "#ece4d3"; ctx.lineWidth = 2; ctx.beginPath();
+    ctx.fillStyle = "#1c1d21"; ctx.fillRect(0, 0, c.width, c.height); ctx.strokeStyle = "#2a2f39"; ctx.beginPath(); ctx.moveTo(0, c.height / 2); ctx.lineTo(c.width, c.height / 2); ctx.stroke();
+    ctx.strokeStyle = "#5b8def"; ctx.lineWidth = 2; ctx.beginPath();
     this.history.forEach((p, i) => { const x = (i / Math.max(1, this.history.length - 1)) * c.width, y = c.height - p * c.height; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
     ctx.stroke();
-    $("#live-cues").innerHTML = topCues(r.aspects).map(cueHtml).join("");
+    $("#live-checks").innerHTML = checksHtml(checkScores(r.aspects), true);
     $("#live-aspects").innerHTML = Object.values(r.aspects).map(a => `<div><span class="n">${esc(a.label)}</span><div class="bar"><i style="width:${(a.score || 0) * 100}%;background:${scoreColor(a.score)}"></i></div></div>`).join("");
     $("#live-events").innerHTML = eventChips(r.events);
   }
@@ -620,7 +671,7 @@ class LiveCall {
     if (!this.running || this.stopping) return;
     this.stopping = true;
     if (window.speechSynthesis) speechSynthesis.cancel();
-    this.status("computing final verdict…"); $("#live-stop").disabled = true;
+    this.status("computing the final verdict and the semantic judgement…"); $("#live-stop").disabled = true;
     if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify({ type: "stop" }));
     else this.cleanup();
   }
@@ -637,7 +688,7 @@ function resetLivePanel() {
   $("#live-conf").textContent = "waiting for speech…"; $("#live-meta").textContent = "";
   $("#live-pfill").style.width = "0%"; $(".live-verdict .pmark").style.left = "50%";
   setLabels($("#live-lab-human"), $("#live-lab-synthetic"), null, true);
-  $("#live-cues").innerHTML = ""; $("#live-aspects").innerHTML = ""; $("#live-avg").textContent = "";
+  $("#live-checks").innerHTML = ""; $("#live-aspects").innerHTML = ""; $("#live-avg").textContent = "";
   $("#cap-agent").textContent = "—"; $("#cap-you").textContent = "—"; $$(".cap").forEach(c => c.classList.remove("live"));
   $("#hearing").textContent = "hearing: —"; $("#hearing").className = "hearing";
 }

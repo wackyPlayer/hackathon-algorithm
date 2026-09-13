@@ -6,8 +6,11 @@ Two products:
            about things that do not exist, repeat information back correctly, and does the wording
            read like an LLM (complete sentences, no fillers) or like a person?
 
-Everything is optional and lazy: if faster-whisper or the Anthropic SDK / API key are missing,
-`semantic_analysis` returns {"available": False, ...} and the pipeline simply skips the layer.
+Everything is optional and lazy: if faster-whisper is missing `semantic_analysis` returns
+{"available": False, ...} and the pipeline simply skips the layer. The judge runs on Claude when the
+Anthropic SDK and credentials are present, otherwise on Gemini (`GEMINI_API_KEY`), with the same JSON
+schema. A transcript that already exists (the live call transcribes every caller turn as it happens and
+knows the agent's lines verbatim) can be judged directly without re-transcribing.
 """
 from __future__ import annotations
 
@@ -89,6 +92,18 @@ def claude_available() -> bool:
 
 def _has_profile() -> bool:
     return os.path.isdir(os.path.expanduser("~/.config/anthropic"))
+
+
+def gemini_available() -> bool:
+    return bool(settings.gemini_api_key)
+
+
+def judge_available() -> bool:
+    return claude_available() or gemini_available()
+
+
+def judge_engine() -> str | None:
+    return "claude" if claude_available() else ("gemini" if gemini_available() else None)
 
 
 _whisper_models: dict = {}
@@ -238,36 +253,100 @@ def judge_with_claude(agent_turns: list, caller_turns: list) -> dict:
     return json.loads(text)
 
 
+def _gemini_schema(schema: dict) -> dict:
+    """Gemini's responseSchema is an OpenAPI subset: drop the JSON-schema-only keywords."""
+    if isinstance(schema, dict):
+        return {k: _gemini_schema(v) for k, v in schema.items() if k not in ("additionalProperties", "minimum", "maximum")}
+    if isinstance(schema, list):
+        return [_gemini_schema(v) for v in schema]
+    return schema
+
+
+def judge_with_gemini(agent_turns: list, caller_turns: list) -> dict:
+    """Same judgement as `judge_with_claude`, through Gemini's REST API with a JSON response schema."""
+    import httpx
+
+    dialogue = _format_dialogue(agent_turns, caller_turns)
+    user = ("Transcript of the call (timestamps in seconds from the start of the recording):\n\n" + dialogue +
+            "\n\nAnalyse the CALLER only and fill the JSON schema.")
+    gen = {"temperature": 0.2, "maxOutputTokens": 2048, "responseMimeType": "application/json",
+           "responseSchema": _gemini_schema(JUDGE_SCHEMA), "thinkingConfig": {"thinkingLevel": "minimal"}}
+    body = {"system_instruction": {"parts": [{"text": JUDGE_SYSTEM}]}, "contents": [{"parts": [{"text": user}]}],
+            "generationConfig": gen}
+    url = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    last = "gemini unavailable"
+    for model in dict.fromkeys((settings.gemini_model, settings.gemini_fallback_model, "gemini-flash-latest")):
+        for attempt in (0, 1):
+            r = httpx.post(url.format(model=model), headers={"x-goog-api-key": settings.gemini_api_key}, json=body,
+                           timeout=settings.claude_timeout_s)
+            if r.status_code == 400 and attempt == 0 and "thinkingConfig" in body["generationConfig"]:
+                body["generationConfig"] = {k: v for k, v in gen.items() if k != "thinkingConfig"}
+                continue
+            break
+        if r.status_code in (404, 429, 500, 503):
+            last = f"{model}: {r.status_code}"
+            continue
+        r.raise_for_status()
+        c = r.json()["candidates"][0]
+        text = "".join(p.get("text", "") for p in c.get("content", {}).get("parts", []) if not p.get("thought")).strip()
+        try:
+            j = json.loads(text)
+        except Exception:
+            return {"error": f"gemini returned non-JSON: {text[:80]}"}
+        j["engine"] = model
+        return j
+    return {"error": last}
+
+
+def judge(agent_turns: list, caller_turns: list) -> dict:
+    """Claude when available, else Gemini; {"error": ...} when neither works."""
+    if claude_available():
+        j = judge_with_claude(agent_turns, caller_turns)
+        if "error" not in j:
+            j["engine"] = settings.claude_model
+            return j
+        if not gemini_available():
+            return j
+    if gemini_available():
+        return judge_with_gemini(agent_turns, caller_turns)
+    return {"error": "no judge credentials (ANTHROPIC_API_KEY or GEMINI_API_KEY)"}
+
+
 def semantic_analysis(call: Call, vad_c: Vad, vad_a: Vad | None, agent_text_turns: list | None = None,
-                      use_llm: bool = True) -> dict:
-    """Run STT (+ optional Claude judge). Never raises."""
+                      use_llm: bool = True, transcript: dict | None = None) -> dict:
+    """Run STT (+ optional LLM judge). `transcript` = {"caller": [...], "agent": [...]} skips the STT. Never raises."""
     res: dict = {"available": False, "features": {}}
-    if not whisper_available():
-        res["error"] = "faster-whisper not installed"
-        return res
     t0 = time.time()
-    try:
-        caller_turns = transcribe(call.caller, vad_c.turns, settings.semantic_max_seconds)
-        if agent_text_turns is not None:
-            agent_turns = agent_text_turns
-        elif vad_a is not None and call.agent is not None:
-            agent_turns = transcribe(call.agent, vad_a.turns, settings.semantic_max_seconds)
-        else:
-            agent_turns = []
-    except Exception as exc:
-        log.exception("transcription failed: %s", exc)
-        res["error"] = f"transcription failed: {exc}"
-        return res
+    if transcript is not None:
+        caller_turns = list(transcript.get("caller") or [])
+        agent_turns = list(transcript.get("agent") or (agent_text_turns or []))
+    else:
+        if not whisper_available():
+            res["error"] = "faster-whisper not installed"
+            return res
+        try:
+            caller_turns = transcribe(call.caller, vad_c.turns, settings.semantic_max_seconds)
+            if agent_text_turns is not None:
+                agent_turns = agent_text_turns
+            elif vad_a is not None and call.agent is not None:
+                agent_turns = transcribe(call.agent, vad_a.turns, settings.semantic_max_seconds)
+            else:
+                agent_turns = []
+        except Exception as exc:
+            log.exception("transcription failed: %s", exc)
+            res["error"] = f"transcription failed: {exc}"
+            return res
     res["stt_seconds"] = round(time.time() - t0, 2)
     res["transcript"] = {"caller": caller_turns, "agent": agent_turns}
     res["features"].update(text_features(caller_turns))
     res["available"] = True
-    if use_llm and caller_turns and claude_available():
+    if use_llm and caller_turns and judge_available():
         t1 = time.time()
         try:
-            j = judge_with_claude(agent_turns, caller_turns)
+            j = judge(agent_turns, caller_turns)
             if "error" not in j:
                 res["judge"] = j
+                res["judge_engine"] = j.get("engine")
                 res["features"]["sem_fabrication_p"] = float(j["fabrication_probability"])
                 res["features"]["sem_llm_style_p"] = float(j["llm_style_probability"])
                 res["features"]["sem_synthetic_p"] = float(j["synthetic_probability"])
@@ -282,6 +361,6 @@ def semantic_analysis(call: Call, vad_c: Vad, vad_a: Vad | None, agent_text_turn
             log.warning("claude judge failed: %s", exc)
             res["judge_error"] = str(exc)
         res["llm_seconds"] = round(time.time() - t1, 2)
-    elif use_llm and not claude_available():
-        res["judge_error"] = "anthropic SDK or credentials not available"
+    elif use_llm and not judge_available():
+        res["judge_error"] = "no judge credentials (ANTHROPIC_API_KEY or GEMINI_API_KEY)"
     return res

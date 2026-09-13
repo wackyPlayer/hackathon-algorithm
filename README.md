@@ -1,4 +1,4 @@
-# Altur Voice Shield — synthetic caller detection for bank phone lines
+# Calliope — autenticación de voz con IA (synthetic caller detection for bank phone lines)
 
 HackMTY 2026 · Altur challenge *"Defend the Bank Against Voice Deepfakes"*.
 
@@ -69,13 +69,16 @@ interrupts, falls silent and talks over the caller. From the two VAD timelines w
 it restarts, back-channels ("ajá", "sí") during agent speech, who fills dead air and after how long,
 turn-length statistics, intra-turn pauses and false starts, plus an overall regularity index.
 
-**3. Semantic** (`backend/features/semantic.py`, optional) — both channels are transcribed with
-faster-whisper (Spanish) and Claude (`claude-opus-5`, structured JSON output, low effort) judges the caller's
-replies: does it invent an answer when the agent asks about a product that does not exist, does it repeat
-information back correctly, does the wording read like an LLM (complete sentences, no fillers, no
-self-corrections). Cheap transcript statistics (filler rate, denial phrases, formulaic politeness) are
-computed even without an API key. Because CPU transcription costs ~1 s per second of speech, this layer
-runs as a **cascade**: only when the fast model is unsure (`SEMANTIC_MODE=uncertain`, 0.30 < p < 0.70).
+**3. Semantic** (`backend/features/semantic.py`) — what the caller actually *says*. Both channels are
+transcribed with faster-whisper (Spanish) and a judge (Claude `claude-opus-5` when the Anthropic SDK and
+credentials exist, otherwise **Gemini** through `GEMINI_API_KEY`, same JSON schema) reads the dialogue: does
+the caller invent an answer when the agent asks about a product that does not exist ("a person says *I don't
+have that*, a language model tends to invent an answer"), does it repeat information back correctly, does the
+wording read like an LLM (complete sentences, no fillers, no self-corrections). Cheap transcript statistics
+(filler rate, denial phrases, formulaic politeness) are computed even without a judge. In the analysis tab it
+is opt-in (CPU transcription costs ~1 s per second of speech; `SEMANTIC_MODE=uncertain` runs it as a cascade
+when the fast model is unsure); in the **live call** the caller is transcribed turn by turn anyway, so the
+judge runs on the finished transcript at "End call" and its probability is fused into the final verdict.
 
 **Decision.** All features go through a single, heavily regularised logistic regression (chosen against
 gradient boosting by grouped cross-validation; the LR generalises better to unseen callers and is fully
@@ -175,9 +178,10 @@ PORT=8010 WORKERS=4 SEMANTIC_MODE=uncertain ANTHROPIC_API_KEY=sk-ant-... ./run.s
 ```
 
 Environment (see `.env.example`; a `.env` file next to `README.md` is loaded automatically): `MODEL_PATH`,
-`SEMANTIC_MODE=off|uncertain|always`, `WHISPER_MODEL`, `ANTHROPIC_API_KEY`, `ENABLE_EMBEDDINGS`, `SAMPLES_DIR`,
-`DECISION_THRESHOLD`, `MAX_SECONDS`; live agent: `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`,
-`ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL`, `LIVE_WHISPER_MODEL`, `LIVE_ANSWER_TIMEOUT_S`.
+`SEMANTIC_MODE=off|uncertain|always`, `WHISPER_MODEL`, `ANTHROPIC_API_KEY` (judge; Gemini is used otherwise),
+`ENABLE_EMBEDDINGS`, `SAMPLES_DIR`, `DECISION_THRESHOLD`, `MAX_SECONDS`; live agent: `GEMINI_API_KEY`,
+`GEMINI_MODEL`, `GEMINI_FALLBACK_MODEL`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL`,
+`LIVE_WHISPER_MODEL`, `LIVE_ANSWER_TIMEOUT_S`, `LIVE_TALK_MOD_DB`, `LIVE_PEAK_MARGIN_DB`, `LIVE_ESCALATE_P`.
 
 Tests: `.venv\Scripts\python.exe -m pytest -q` (14 end-to-end API tests on generated clips, no dataset needed).
 
@@ -195,13 +199,16 @@ and the fallback adds ~2 s per request that has nothing to do with the detector.
 ## Dashboard
 
 * **Analyze recording** — drop a WAV (or pick a dataset call). The verdict and its confidence dominate the
-  page; under the probability bar the *Human* / *Synthetic* labels glow green / red until the verdict is known,
-  then the losing one turns gray. The three strongest indicators are always visible; *Why this result* expands
-  the full list of ten indicators (0 = human-like, 100 = synthetic-like) and each indicator opens to its
-  measurements. Then the spectrogram with both speaker lanes, response-latency labels, interruption /
-  silence-fill / back-channel markers, breath marks and pitch track; attack profile, model signals, feature
-  contributions and the raw JSON are collapsed sections. Batch mode runs many files through `/detect` and
-  tabulates verdicts and latency.
+  page; under the probability bar the *Human* / *Synthetic* labels are ringed green / red until the verdict is
+  known, then the losing one turns gray. Below them the **three security checks of the brief** — *Voice*,
+  *Conversation* (how the caller handles the agent interrupting, falling silent and talking over them: people
+  recover instantly and messily, machines consistently) and *Semantics* (what the caller says when asked to
+  repeat information or about things that do not exist) — each with its score, the strongest cue behind it and
+  what it measures; *All indicators* expands the ten underlying indicators (0 = human-like, 100 =
+  synthetic-like) and each opens to its measurements. Then the semantic transcript and judgement (when run),
+  the spectrogram with both speaker lanes, response-latency labels, interruption / silence-fill / back-channel
+  markers, breath marks and pitch track; attack profile, model signals, feature contributions and the raw JSON
+  are collapsed sections. Batch mode runs many files through `/detect` and tabulates verdicts and latency.
 * **Live call with the agent** — you are the caller; the bank agent "Marina" is generated live on the server
   (`backend/live_agent.py` + the `/ws/live` session in `backend/main.py`):
   **Gemini** writes every line from what you just said (`GEMINI_API_KEY`, default model `gemini-3.1-flash-lite`,
@@ -210,7 +217,7 @@ and the fallback adds ~2 s per request that has nothing to do with the detector.
   speech synthesis is used) and **faster-whisper** (`LIVE_WHISPER_MODEL=base`, pre-loaded at start-up) hears
   you. The flow is the same as Altur's agent: greeting, a question the agent deliberately interrupts after
   2.5 s of your speech, a folio you repeat back, a probe about an insurance product that does not exist, a
-  5-second silence, a last question, a closing. End-of-turn detection, the interruption and the no-answer
+  5-second silence, a last question the agent talks over, a closing. End-of-turn detection, the interruption and the no-answer
   timeout (9 s) run server-side on the 8 kHz stream; the browser only captures the microphone and plays the
   agent's audio, reporting when it starts and stops so the turn timeline is exact. The verdict, aspects and
   events update every 2 s; "End call" returns the full report, the transcript and the recorded WAV.
@@ -240,13 +247,12 @@ and the fallback adds ~2 s per request that has nothing to do with the detector.
   look like a synthetic pipeline (*possible false positive*); a very noisy line or mains hum masks the cues
   (*possible false negative* / unreliable verdict). The report is computed from the same features the detector
   uses, so it describes what the model will actually see.
-* **Look** — headings, verdicts and indicator names use the *Monster Friend Fore* font, all secondary and
-  technical information (meta lines, cue scores, measurements, event chips, tables) the pixel monospace
-  *Monobit* in gray at a visibly smaller weight (`frontend/fonts/`); square corners, flat colours, hard offset
-  shadows; the confidence / probability bars are plain filled rectangles. Monster Friend draws
-  `# $ % & ( ) * + / < = > @ [ ] ^ _ { | } ~` as the Undertale heart, so those characters fall back to the
-  monospace font (`unicode-range` in `style.css`). The spectrogram maps a fixed 55 dB window below the loudest
-  bins (not silence-floor-to-peak), which keeps harmonics readable instead of saturating speech.
+* **Look** — minimal: the Calliope logo palette (shield blue `#2f6be4` on the light gray ground, dark gray
+  text, white cards), the *Switzer* typeface (Fontshare, bundled in `frontend/fonts/`) for everything, thin
+  borders and rounded cards, secondary information in smaller gray text. A **dark mode** toggle sits in the
+  header (☾ / ☀, remembered in the browser; the system preference is the default). The spectrogram maps a
+  fixed 55 dB window below the loudest bins (not silence-floor-to-peak), which keeps harmonics readable
+  instead of saturating speech.
 
 ## Sharing the dashboard and API with other people
 
