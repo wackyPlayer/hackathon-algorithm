@@ -214,6 +214,12 @@ and the fallback adds ~2 s per request that has nothing to do with the detector.
   timeout (9 s) run server-side on the 8 kHz stream; the browser only captures the microphone and plays the
   agent's audio, reporting when it starts and stops so the turn timeline is exact. The verdict, aspects and
   events update every 2 s; "End call" returns the full report, the transcript and the recorded WAV.
+  The caller's speech is detected against a noise floor tracked as the 10th percentile of the last 15 s of
+  100 ms block levels (seeded from the microphone check), never against a fixed level: a −40 dBFS room used to
+  read as continuous speech, so no turn ever ended and the agent never answered. Turns are capped at 20 s,
+  caller and agent actions run under one lock (an answer is queued, never dropped), the browser guards the
+  agent's end-of-audio events with watchdogs, and speech the transcriber cannot read gets a "¿me lo puede
+  repetir?" instead of silence. The status line shows "hearing you…" while the server detects your voice.
 * **Microphone check** — *Test microphone* (and, automatically, the first *Start call*) records 2 s of silence
   and a spoken sentence, sends it to `POST /miccheck` and grades the input **good / fair / poor** with plain
   warnings and the risk they carry: digital silence or a perfectly constant floor from a noise gate, browser

@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -297,7 +298,13 @@ class LiveSession:
     """One live call: caller PCM (int16 mono 8 kHz) from the browser, agent lines from Gemini/ElevenLabs.
 
     The browser only captures the microphone and plays the agent's audio; the conversation state machine,
-    the caller's end-of-utterance detection and the speech recognition all live here."""
+    the caller's end-of-utterance detection and the speech recognition all live here.
+
+    Caller speech is detected on 100 ms blocks against a noise floor that is the 10th percentile of the
+    last 15 s of block levels (seeded from the microphone check). A fixed floor cannot work: a laptop in a
+    noisy room easily sits at -40 dBFS, which a -60 dBFS assumption reads as continuous speech, so no
+    utterance ever ends and the agent never answers. Utterances are also capped in length, and every
+    caller/agent action runs under one lock so an answer is queued instead of dropped."""
 
     def __init__(self, ws: WebSocket, analyzer: Analyzer):
         self.ws, self.an = ws, analyzer
@@ -315,14 +322,20 @@ class LiveSession:
         self.busy = False
         self.done = False
         self.interrupted_step = -1
+        self.repeat_asked = -1
         self.timer: asyncio.Task | None = None
         self.pipeline: asyncio.Task | None = None
+        self.lock = asyncio.Lock()
         # caller utterance detection (100 ms blocks)
+        self.levels: deque = deque(maxlen=150)
         self.floor_db = -60.0
+        self.seeded = False
         self.speaking = False
+        self.vad_sent = False
         self.utt_start: float | None = None
         self.last_speech: float | None = None
         self.caller_turns: list = []
+        self.utterances = 0
 
     # ---------------------------------------------------------------- audio in
     def seconds(self) -> float:
@@ -331,28 +344,47 @@ class LiveSession:
     def audio(self) -> np.ndarray:
         return np.concatenate(self.chunks) if self.chunks else np.zeros(0, np.float32)
 
+    def seed_floor(self, floor_db) -> None:
+        """Start from the noise floor the microphone check measured (dBFS) instead of a guess."""
+        try:
+            f = float(floor_db)
+        except (TypeError, ValueError):
+            return
+        if np.isfinite(f) and -100.0 < f < -5.0:
+            self.floor_db = f
+            self.levels.extend([f] * 20)
+            self.seeded = True
+
     def add(self, data: bytes) -> list:
         """Append PCM; return finalized caller utterances [(start_s, end_s)] detected in this chunk."""
         x = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
         self.chunks.append(x)
         finished = []
+        rise = settings.live_speech_rise_db
         for i in range(0, len(x), 800):
             blk = x[i:i + 800]
             if len(blk) < 400:
                 break
             t = (self.n + i) / 8000.0
             db = 20 * np.log10(float(np.sqrt(np.mean(blk ** 2))) + 1e-6)
-            if not self.speaking and db < self.floor_db + 6:
-                self.floor_db = 0.95 * self.floor_db + 0.05 * db
-            thr = max(self.floor_db + 9.0, -50.0)
-            if db > thr:
-                if not self.speaking:
-                    self.speaking, self.utt_start = True, t
-                self.last_speech = t
-            elif self.speaking and self.last_speech is not None and t - self.last_speech >= settings.live_end_silence_s:
-                self.speaking = False
-                if self.last_speech - self.utt_start >= settings.live_min_utterance_s:
-                    finished.append((self.utt_start, self.last_speech + 0.15))
+            self.levels.append(db)
+            if len(self.levels) < 10:          # first second: only learn the room
+                self.floor_db = min(self.floor_db, db) if not self.seeded else self.floor_db
+                continue
+            self.floor_db = float(np.percentile(self.levels, 10))
+            thr_on = max(self.floor_db + rise, -62.0)
+            thr_off = max(self.floor_db + rise * 0.5, -66.0)
+            if not self.speaking:
+                if db > thr_on:
+                    self.speaking, self.utt_start, self.last_speech = True, t, t
+            else:
+                if db > thr_off:
+                    self.last_speech = t
+                too_long = t - self.utt_start >= settings.live_max_utterance_s
+                if t - self.last_speech >= settings.live_end_silence_s or too_long:
+                    self.speaking = False
+                    if self.last_speech - self.utt_start >= settings.live_min_utterance_s:
+                        finished.append((self.utt_start, min(self.last_speech + 0.15, t)))
         self.n += len(x)
         return finished
 
@@ -399,12 +431,31 @@ class LiveSession:
     async def status(self, text: str) -> None:
         await self.send({"type": "status", "text": text})
 
+    async def vad_feedback(self) -> None:
+        """Tell the browser when the server starts / stops hearing the caller (debuggable turn taking)."""
+        if self.speaking != self.vad_sent:
+            self.vad_sent = self.speaking
+            await self.send({"type": "vad", "speaking": self.speaking, "floor_db": round(self.floor_db, 1),
+                             "awaiting": self.await_answer, "t": round(self.seconds(), 2)})
+
+    async def exclusive(self, coro) -> None:
+        """Run one caller/agent action at a time; later actions wait instead of being dropped."""
+        async with self.lock:
+            await coro
+
     # ---------------------------------------------------------------- conversation flow
     def cancel_timer(self) -> None:
         # never cancel the task we are running in (the timer itself calls speak_step after a timeout / silence)
         if self.timer is not None and not self.timer.done() and self.timer is not asyncio.current_task():
             self.timer.cancel()
         self.timer = None
+
+    def _say_payload(self, text: str, audio: bytes | None, kind: str, step: dict | None = None, brain: str = "canned") -> dict:
+        step = step or {}
+        return {"type": "agent_say", "step": self.step + 1, "steps": len(STEPS), "kind": kind, "text": text,
+                "audio_b64": base64.b64encode(audio).decode("ascii") if audio else None,
+                "silence_after": step.get("silence_after", 0), "end": bool(step.get("end")),
+                "brain": brain, "voice": "elevenlabs" if audio else "browser"}
 
     async def speak_step(self, caller_text: str) -> None:
         """Generate (Gemini) + synthesize (ElevenLabs) the current step's line and hand it to the browser."""
@@ -419,17 +470,19 @@ class LiveSession:
             text = await run_in_threadpool(self.brain.line, self.step, caller_text)
             await self.status("synthesizing…")
             audio = await run_in_threadpool(self.voice.synthesize, text)
-            await self.send({"type": "agent_say", "step": self.step + 1, "steps": len(STEPS), "kind": step["kind"],
-                             "text": text, "audio_b64": base64.b64encode(audio).decode("ascii") if audio else None,
-                             "silence_after": step.get("silence_after", 0), "end": bool(step.get("end")),
-                             "brain": "gemini" if (self.brain.enabled and not self.brain.last_error) else "canned",
-                             "voice": "elevenlabs" if audio else "browser"})
+            await self.send(self._say_payload(text, audio, step["kind"], step,
+                                              "gemini" if (self.brain.enabled and not self.brain.last_error) else "canned"))
             await self.status("")
         except Exception as exc:  # pragma: no cover
             log.exception("speak_step failed: %s", exc)
             await self.send({"type": "error", "message": f"agent failed: {exc}"})
         finally:
             self.busy = False
+
+    async def say_canned(self, text: str, kind: str) -> None:
+        """A fixed line outside the step flow (the deliberate interruption, 'please repeat')."""
+        audio = await run_in_threadpool(self.voice.synthesize, text)
+        await self.send(self._say_payload(text, audio, kind))
 
     async def on_agent_event(self, ev: dict) -> None:
         self.agent_events.append(ev)
@@ -443,29 +496,34 @@ class LiveSession:
         if step.get("end"):
             self.done = True
             await self.send({"type": "agent_done"})
-        elif step.get("silence_after"):
+        elif step.get("silence_after") and ev.get("kind") != "repeat":
             async def later():
                 await asyncio.sleep(step["silence_after"])
                 self.step += 1
-                await self.speak_step("")
+                await self.exclusive(self.speak_step(""))
             self.cancel_timer()
             self.timer = asyncio.create_task(later())
         else:
             self.await_answer = True
             self.cancel_timer()
             self.timer = asyncio.create_task(self.answer_timeout())
+            await self.status("listening…")
 
     async def answer_timeout(self) -> None:
         await asyncio.sleep(settings.live_answer_timeout_s)
-        while self.speaking or self.busy:         # caller mid-sentence or a transcription in flight: wait
+        waited = 0.0
+        while (self.speaking or self.busy) and waited < 15.0:   # caller mid-sentence or transcription in flight
             await asyncio.sleep(0.3)
+            waited += 0.3
         if self.await_answer and not self.busy and not self.done:
             log.info("live: no answer within %.0fs, agent moves on", settings.live_answer_timeout_s)
             await self.send({"type": "caller_said", "text": "(no se escuchó respuesta)", "t": round(self.seconds(), 2)})
             self.step += 1
-            await self.speak_step("")
+            await self.exclusive(self.speak_step(""))
 
     async def on_utterance(self, s: float, e: float) -> None:
+        self.utterances += 1
+        log.info("live: caller utterance %.1f-%.1f s (floor %.0f dBFS, awaiting=%s)", s, e, self.floor_db, self.await_answer)
         if not self.await_answer or self.busy or self.done:
             return
         x = self.audio()[int(s * 8000):int(e * 8000)]
@@ -482,7 +540,13 @@ class LiveSession:
         if self.done:
             return
         if not text.strip():
-            await self.status("")
+            if e - s >= 1.0 and self.repeat_asked != self.step:
+                # something was said but not understood: ask once, then the normal timeout applies
+                self.repeat_asked = self.step
+                await self.send({"type": "caller_said", "text": "(no se entendió)", "t": round(s, 2)})
+                await self.say_canned("Perdón, no le escuché bien. ¿Me lo puede repetir, por favor?", "repeat")
+                return          # the agent's end event re-arms await_answer
+            await self.status("listening…")
             self.await_answer = True
             self.timer = asyncio.create_task(self.answer_timeout())
             return
@@ -491,22 +555,22 @@ class LiveSession:
         self.step += 1
         await self.speak_step(text)
 
-    async def maybe_interrupt(self) -> None:
+    def interrupt_due(self) -> bool:
         """Deliberately talk over the caller once, during the step that asks for a long answer."""
         if self.done or self.busy or not self.await_answer or self.agent_speaking or not self.speaking:
-            return
+            return False
         step = STEPS[min(self.step, len(STEPS) - 1)]
         after = step.get("interrupt_after")
         if not after or self.interrupted_step == self.step or self.utt_start is None:
-            return
+            return False
         if self.seconds() - self.utt_start < after:
-            return
+            return False
         self.interrupted_step = self.step
-        text = step["interrupt_text"]
-        audio = await run_in_threadpool(self.voice.synthesize, text)
-        await self.send({"type": "agent_say", "step": self.step + 1, "steps": len(STEPS), "kind": "interrupt", "text": text,
-                         "audio_b64": base64.b64encode(audio).decode("ascii") if audio else None, "silence_after": 0,
-                         "end": False, "brain": "canned", "voice": "elevenlabs" if audio else "browser"})
+        return True
+
+    async def do_interrupt(self) -> None:
+        step = STEPS[min(self.step, len(STEPS) - 1)]
+        await self.say_canned(step["interrupt_text"], "interrupt")
 
     async def analyze(self, final: bool):
         x = self.audio()
@@ -517,6 +581,7 @@ class LiveSession:
         res = await run_in_threadpool(self.an.analyze, call, segs, self.agent_text_turns(), final, final, False)
         res["live"] = {"seconds": round(self.seconds(), 1), "agent_turns": len(segs), "step": self.step,
                        "caller_turns": self.caller_turns if final else len(self.caller_turns),
+                       "utterances": self.utterances, "floor_db": round(self.floor_db, 1),
                        "brain": "gemini" if self.brain.enabled else "canned", "voice": "elevenlabs" if self.voice.enabled else "browser"}
         return res
 
@@ -538,11 +603,8 @@ async def ws_live(ws: WebSocket):
         except Exception as exc:  # pragma: no cover
             log.warning("live update failed: %s", exc)
 
-    def spawn_pipeline(coro):
-        if sess.pipeline is not None and not sess.pipeline.done():
-            coro.close()
-            return
-        sess.pipeline = asyncio.create_task(coro)
+    def spawn(coro):
+        sess.pipeline = asyncio.create_task(sess.exclusive(coro))
 
     try:
         while True:
@@ -551,9 +613,10 @@ async def ws_live(ws: WebSocket):
                 break
             if msg.get("bytes"):
                 for s, e in sess.add(msg["bytes"]):
-                    spawn_pipeline(sess.on_utterance(s, e))
-                if sess.speaking:
-                    spawn_pipeline(sess.maybe_interrupt())
+                    spawn(sess.on_utterance(s, e))
+                if sess.speaking and sess.interrupt_due():
+                    spawn(sess.do_interrupt())
+                await sess.vad_feedback()
                 if sess.n - sess.last_analyzed >= interval * 8000 and (inflight["task"] is None or inflight["task"].done()):
                     sess.last_analyzed = sess.n
                     inflight["task"] = asyncio.create_task(update_task())
@@ -564,9 +627,10 @@ async def ws_live(ws: WebSocket):
                     continue
                 t = m.get("type")
                 if t == "start":
+                    sess.seed_floor(m.get("floor_dbfs"))
                     await sess.send({"type": "hello", "gemini": sess.brain.enabled, "elevenlabs": sess.voice.enabled,
-                                     "steps": [s["kind"] for s in STEPS]})
-                    spawn_pipeline(sess.speak_step(""))
+                                     "steps": [s["kind"] for s in STEPS], "floor_db": round(sess.floor_db, 1)})
+                    spawn(sess.speak_step(""))
                 elif t == "agent":
                     await sess.on_agent_event({"event": m.get("event"), "t": float(m.get("t", sess.seconds())),
                                                "text": m.get("text", ""), "kind": m.get("kind", "")})

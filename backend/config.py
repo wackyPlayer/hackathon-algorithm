@@ -96,6 +96,8 @@ class Settings:
     live_end_silence_s: float = _f("LIVE_END_SILENCE_S", 1.0)      # silence that ends a caller utterance
     live_min_utterance_s: float = _f("LIVE_MIN_UTTERANCE_S", 0.4)
     live_answer_timeout_s: float = _f("LIVE_ANSWER_TIMEOUT_S", 9.0)   # agent moves on if the caller says nothing
+    live_max_utterance_s: float = _f("LIVE_MAX_UTTERANCE_S", 20.0)    # a caller turn is cut here (monologue or noise)
+    live_speech_rise_db: float = _f("LIVE_SPEECH_RISE_DB", 8.0)       # speech = this far above the tracked noise floor
 
     # --- misc ---
     log_level: str = _s("LOG_LEVEL", "INFO")

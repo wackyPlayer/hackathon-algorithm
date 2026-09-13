@@ -449,7 +449,7 @@ async function micCheck(seconds = 5) {
 class LiveCall {
   constructor() {
     this.ws = null; this.ctx = null; this.sent = 0; this.speaking = false; this.lastSpeech = 0; this.floor = -60;
-    this.history = []; this.running = false; this.voice = null; this.queue = []; this.playing = false; this.stopping = false;
+    this.history = []; this.running = false; this.voice = null; this.queue = []; this.playing = false; this.stopping = false; this.levels = [];
   }
   t() { return this.sent / 8000; }
   log(text, kind, cls = "") {
@@ -459,6 +459,7 @@ class LiveCall {
   status(t) { $("#live-status").textContent = t; }
   async start() {
     $("#live-result").innerHTML = ""; $("#agent-log").innerHTML = ""; $("#live-events").innerHTML = ""; this.history = []; this.queue = []; this.playing = false; this.stopping = false;
+    this.sent = 0; this.speaking = false; this.floor = -60; this.levels = []; this.lastSpeech = 0;
     $("#live-start").disabled = true;
     // microphone quality check first (skipped if one was done in the last 10 minutes) so the user knows
     // whether this input can bias the verdict
@@ -478,7 +479,8 @@ class LiveCall {
     $("#live-stop").disabled = false; this.status("connecting the agent…");
     resetLivePanel();
     this.pickVoice();
-    this.ws.send(JSON.stringify({ type: "start" }));
+    // seed the server's speech detector with the noise floor the microphone check measured
+    this.ws.send(JSON.stringify({ type: "start", floor_dbfs: (MIC.last && MIC.last.metrics) ? MIC.last.metrics.floor_dbfs : null }));
   }
   pickVoice() {
     const vs = window.speechSynthesis ? speechSynthesis.getVoices() : [];
@@ -488,11 +490,12 @@ class LiveCall {
     if (!this.running || !this.ws || this.ws.readyState !== 1) return;
     this.ws.send(pcm); this.sent += 800;
     const db = 20 * Math.log10(rms + 1e-6);
-    if (!this.speaking && db < this.floor + 6) this.floor = this.floor * 0.95 + db * 0.05;
-    const thr = Math.max(this.floor + 9, -50);
+    // same idea as the server: the floor is the 10th percentile of the last 15 s, so a noisy room is not "speech"
+    this.levels.push(db); if (this.levels.length > 150) this.levels.shift();
+    if (this.levels.length >= 10) { const s = [...this.levels].sort((a, b) => a - b); this.floor = s[Math.floor(s.length * 0.1)]; }
     const now = this.t();
-    if (db > thr) { this.speaking = true; this.lastSpeech = now; }
-    else if (this.speaking && now - this.lastSpeech > 0.4) { this.speaking = false; }
+    if (db > Math.max(this.floor + 8, -62)) { this.speaking = true; this.lastSpeech = now; }
+    else if (this.speaking && db <= Math.max(this.floor + 4, -66) && now - this.lastSpeech > 0.4) { this.speaking = false; }
     meter(db, this.speaking);
   }
   sendAgent(ev, text, kind) {
@@ -507,8 +510,14 @@ class LiveCall {
       const end = () => { if (!started) start(); this.sendAgent("end", text, kind); res(); };
       if (m.audio_b64) {
         const a = new Audio("data:audio/mpeg;base64," + m.audio_b64);
-        a.onplaying = start; a.onended = end; a.onerror = () => { this.log("(audio playback failed, using browser voice)", "note", "note"); this.speak(text, kind, res); };
-        a.play().catch(() => { this.log("(autoplay blocked, using browser voice)", "note", "note"); this.speak(text, kind, res); });
+        // the server only listens again after our 'end' event: guard it with a watchdog in case 'ended' never fires
+        let ended = false; const endOnce = () => { if (!ended) { ended = true; clearTimeout(guard); end(); } };
+        let guard = setTimeout(endOnce, (Math.max(3, text.length / 12) + 3) * 1000);
+        a.onloadedmetadata = () => { if (isFinite(a.duration) && a.duration > 0) { clearTimeout(guard); guard = setTimeout(endOnce, (a.duration + 1.5) * 1000); } };
+        a.onplaying = start; a.onended = endOnce;
+        a.onerror = () => { if (ended) return; ended = true; clearTimeout(guard); this.log("(audio playback failed, using browser voice)", "note", "note"); this.speak(text, kind, res); };
+        a.play().catch(() => { if (ended) return; ended = true; clearTimeout(guard); this.log("(autoplay blocked, using browser voice)", "note", "note"); this.speak(text, kind, res); });
+        this._audio = a;
       } else {
         this.speak(text, kind, res);
       }
@@ -520,7 +529,11 @@ class LiveCall {
     const end = () => { start(); this.sendAgent("end", text, kind); done(); };
     if (window.speechSynthesis && this.voice) {
       const u = new SpeechSynthesisUtterance(text); u.voice = this.voice; u.lang = this.voice.lang; u.rate = 1.0;
-      u.onstart = start; u.onend = end; u.onerror = end;
+      // Chrome sometimes never fires onend (it can garbage-collect the utterance): keep a reference + watchdog
+      let ended = false; const endOnce = () => { if (!ended) { ended = true; clearTimeout(guard); end(); } };
+      const guard = setTimeout(endOnce, (Math.max(2, text.length / 11) * 1.4 + 1.5) * 1000);
+      u.onstart = start; u.onend = endOnce; u.onerror = endOnce;
+      this._utterance = u;
       speechSynthesis.speak(u);
       setTimeout(start, 250);
     } else {
@@ -547,10 +560,11 @@ class LiveCall {
     this.playing = false;
   }
   onMessage(m) {
-    if (m.type === "hello") { this.status(`call in progress · agent ${m.gemini ? "Gemini" : "scripted"} · voice ${m.elevenlabs ? "ElevenLabs" : "browser"}`); }
+    if (m.type === "hello") { this.status(`call in progress · agent ${m.gemini ? "Gemini" : "scripted"} · voice ${m.elevenlabs ? "ElevenLabs" : "browser"} · noise floor ${fmt(m.floor_db, 0)} dBFS`); }
     else if (m.type === "agent_say") this.enqueue(m);
     else if (m.type === "caller_said") this.log(m.text, "you", "you");
     else if (m.type === "status") { if (m.text) this.status(m.text); }
+    else if (m.type === "vad") { if (m.awaiting) this.status(m.speaking ? "hearing you…" : "listening…"); }
     else if (m.type === "agent_done") { this.status("agent finished the flow — press End call for the final verdict"); this.log("(the agent hung up)", "note", "note"); }
     else if (m.type === "update" && m.result) this.renderUpdate(m.result);
     else if (m.type === "final") this.renderFinal(m);
